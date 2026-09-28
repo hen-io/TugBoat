@@ -20,7 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 __author__ = "Henrik Ludvigsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
