@@ -21,7 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -392,7 +392,7 @@ def run_self_update(dry_run: bool) -> int:
 
 
 def startup_update_check(cfg: "Config", dry_run: bool) -> None:
-    if not cfg.update_check or os.environ.get(UPDATED_ENV):
+    if not (cfg.update_check or cfg.auto_update) or os.environ.get(UPDATED_ENV):
         if os.environ.get(UPDATED_ENV):
             say(green(f"{SYM['ok']} Updated to {__title__} {__version__}"))
         return
@@ -496,7 +496,7 @@ def load_config(path: Path) -> Config:
         require_root=_parse_bool(raw.get("require_root", "true"), "require_root"),
         docker_user=raw.get("docker_user", "").strip(),
         update_check=_parse_bool(raw.get("update_check", "true"), "update_check"),
-        auto_update=_parse_bool(raw.get("auto_update", "false"), "auto_update"),
+        auto_update=_parse_bool(raw.get("auto_update", "true"), "auto_update"),
         status_file=Path(raw.get("status_file") or container_path / "tugboat.json").expanduser(),
         health_wait=_parse_int(raw.get("health_wait", "60"), "health_wait"),
     )
