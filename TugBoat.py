@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,8 +21,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.1.4"
-__author__ = "Henrik Ludvigsen"
+__version__ = "0.1.6"
+__author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -535,13 +536,14 @@ def setup_docker_user(user: str) -> str | None:
     return None
 
 
-def ensure_root() -> None:
+def ensure_root(non_interactive: bool = False) -> None:
     if os.geteuid() == 0:
         return
     if shutil.which("sudo") is None:
         raise PermissionError("TugBoat needs root to back up container data, and sudo was not found.")
     say(yellow("Not running as root - restarting with sudo"))
-    os.execvp("sudo", ["sudo", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+    sudo = ["sudo", "-n"] if non_interactive else ["sudo"]
+    os.execvp("sudo", [*sudo, sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def find_stacks(root: Path, ignore: set[str] = frozenset()) -> list[Path]:
@@ -627,11 +629,16 @@ def ask_for_action() -> str | None:
         say(yellow("  Invalid choice, try again."))
 
 
-def ask_for_stacks(stacks: list[Path], action: str) -> list[Path]:
+def ask_for_stacks(stacks: list[Path], action: str, snaps: dict[str, dict] | None = None) -> list[Path]:
     title = "check" if action == "healthcheck" else action
     say("\n" + bold(f"Stacks to {title.upper()}"))
+    width = max(len(s.name) for s in stacks)
     for i, s in enumerate(stacks, 1):
-        _menu_item(str(i), s.name)
+        snap = (snaps or {}).get(s.name)
+        if snap:
+            _menu_item(str(i), f"{s.name:<{width}}  {HEALTH_STYLE[snap['health']][1](snap['health'])}")
+        else:
+            _menu_item(str(i), s.name)
     _menu_item("a", bold("ALL stacks"))
     _menu_item("q", dim("Quit"))
     say(dim("  e.g. 1,3 or 2-4"))
@@ -896,26 +903,81 @@ HEALTH_STYLE = {
 }
 
 
+def check_all(stacks: list[Path]) -> dict[str, dict]:
+    if IS_TTY:
+        write(f"  {cyan(SPINNER[0])} {dim(f'Checking {len(stacks)} stack(s)...')}")
+    with ThreadPoolExecutor(max_workers=min(8, len(stacks) or 1)) as pool:
+        snaps = dict(zip((s.name for s in stacks), pool.map(check_health, stacks)))
+    if IS_TTY:
+        write("\r\033[K")
+    return snaps
+
+
+def fmt_ago(iso: str | None) -> str:
+    if not iso:
+        return ""
+    try:
+        seconds = (datetime.now().astimezone() - datetime.fromisoformat(iso)).total_seconds()
+    except ValueError:
+        return ""
+    if seconds < 90:
+        return "just now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit} ago"
+    return ""
+
+
+def print_health_table(stacks: list[Path], snaps: dict[str, dict], db: StatusDB | None) -> None:
+    width = max(len(s.name) for s in stacks)
+    swidth = max(len(snaps[s.name]["summary"]) for s in stacks)
+    for stack in stacks:
+        snap = snaps[stack.name]
+        sym, style = HEALTH_STYLE[snap["health"]]
+        health = f"{snap['health']:<10}"
+        summary = f"{snap['summary']:<{swidth}}"
+        extra = []
+        last = db.stack(stack.name).get("last_update") if db else None
+        if last:
+            extra.append(dim(f"updated {fmt_ago(last)}"))
+        if snap["problems"]:
+            more = f" (+{len(snap['problems']) - 1} more)" if len(snap["problems"]) > 1 else ""
+            extra.append(style(snap["problems"][0] + more))
+        tail = dim("  ·  ").join(extra)
+        say(f"  {style(SYM[sym])} {stack.name:<{width}}  {style(health)} {dim(summary)}  {tail}".rstrip())
+
+
+def show_overview(stacks: list[Path], db: StatusDB | None) -> dict[str, dict]:
+    snaps = check_all(stacks)
+    counts: dict[str, int] = {}
+    for snap in snaps.values():
+        counts[snap["health"]] = counts.get(snap["health"], 0) + 1
+    order = ("healthy", "starting", "unhealthy", "unknown", "stopped")
+    parts = [HEALTH_STYLE[h][1](f"{counts[h]} {h}") for h in order if counts.get(h)]
+    rule("Stacks")
+    print_health_table(stacks, snaps, db)
+    say("\n  " + dim(" · ").join(parts))
+    if db:
+        try:
+            for name, snap in snaps.items():
+                db.set_health(name, snap)
+            db.save()
+        except OSError:
+            pass
+    return snaps
+
+
 def run_healthcheck(selected: list[Path], db: StatusDB | None) -> int:
     say("\n" + dim(" · ").join([bold("HEALTH CHECK"),
                                 f"{len(selected)} stack{'s' if len(selected) > 1 else ''}",
                                 datetime.now().strftime("%Y-%m-%d %H:%M")]))
     rule("Stacks")
-    width = max(len(s.name) for s in selected)
-    bad: list[tuple[str, dict]] = []
-    for stack in selected:
-        if IS_TTY:
-            write(f"  {cyan(SPINNER[0])} {stack.name}")
-        snap = check_health(stack)
-        if IS_TTY:
-            write("\r\033[K")
-        sym, style = HEALTH_STYLE[snap["health"]]
-        health = f"{snap['health']:<10}"
-        say(f"  {style(SYM[sym])} {stack.name:<{width}}  {style(health)} {dim(snap['summary'])}")
-        if snap["problems"]:
-            bad.append((stack.name, snap))
-        if db:
-            db.set_health(stack.name, snap)
+    snaps = check_all(selected)
+    print_health_table(selected, snaps, db)
+    bad = [(s.name, snaps[s.name]) for s in selected if snaps[s.name]["problems"]]
+    if db:
+        for name, snap in snaps.items():
+            db.set_health(name, snap)
 
     if bad:
         rule(f"Problems ({len(bad)})")
@@ -1078,7 +1140,8 @@ def print_report(results: list[StackResult], pending: list[str], action: str,
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Manage Docker Compose stacks.",
-        epilog="Stack names are folder names. With no names, use --all or pick from a list.")
+        epilog="Stack names are folder names. Give them after the action or with --stack. "
+               "With no names, use --all, --auto or pick from a list.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--update", nargs="*", metavar="STACK",
                       help="stop -> backup -> pull -> start -> health check")
@@ -1090,8 +1153,12 @@ def main() -> int:
                       help="check GitHub for a newer TugBoat release")
     mode.add_argument("--self-update", action="store_true",
                       help="install the newest TugBoat release from GitHub")
+    parser.add_argument("--stack", nargs="+", action="extend", metavar="STACK", default=[],
+                        help="stack(s) to act on, for any action (no action given: ask, or update with --auto)")
     parser.add_argument("--all", action="store_true",
                         help="run the action on all stacks (on its own: update all)")
+    parser.add_argument("--auto", action="store_true",
+                        help="no questions: default action update, all stacks unless named, confirm everything")
     parser.add_argument("--skip-backup", action="store_true", help="skip the backup step (update only)")
     parser.add_argument("-v", "--verbose", action="store_true", help="show full command output live")
     parser.add_argument("--dry-run", action="store_true", help="show actions without running them")
@@ -1102,7 +1169,7 @@ def main() -> int:
     try:
         cfg = load_config(CONFIG_FILE)
         if cfg.require_root and not args.dry_run:
-            ensure_root()
+            ensure_root(non_interactive=args.auto)
         banner()
         user_warning = setup_docker_user(cfg.docker_user)
         if user_warning:
@@ -1122,41 +1189,46 @@ def main() -> int:
         return 0
 
     action: str | None = None
-    names: list[str] = []
+    raw_names: list[str] = list(args.stack)
     for a in ("update", "start", "stop", "healthcheck"):
         value = getattr(args, a)
         if value is not None:
             action = a
-            names = [n for v in value for n in v.split(",") if n.strip()]
-    if action is None and args.all:
+            raw_names = list(value) + raw_names
+    names = [n.strip() for v in raw_names for n in v.split(",") if n.strip()]
+    if action is None and (args.all or args.auto):
         action = "update"
+
+    db: StatusDB | None = None
+    if not args.dry_run:
+        db = StatusDB(cfg.status_file)
+        db.forget_missing(stacks)
+
+    if names and args.all:
+        say_error("Give stack names or --all, not both.")
+        return 2
+
+    snaps: dict[str, dict] | None = None
     if action is None:
+        snaps = show_overview(stacks, db)
         action = ask_for_action()
         if action is None:
             say(dim("Nothing selected, exiting."))
             return 0
 
-    if names and args.all:
-        say_error("Give stack names or --all, not both.")
-        return 2
     if names:
         try:
             selected = pick_stacks_by_name(names, stacks, cfg)
         except ValueError as e:
             say_error(str(e))
             return 2
-    elif args.all or action == "healthcheck":
+    elif args.all or args.auto or action == "healthcheck":
         selected = stacks
     else:
-        selected = ask_for_stacks(stacks, action)
+        selected = ask_for_stacks(stacks, action, snaps)
     if not selected:
         say(dim("Nothing selected, exiting."))
         return 0
-
-    db: StatusDB | None = None
-    if not args.dry_run:
-        db = StatusDB(cfg.status_file)
-        db.forget_missing(stacks)
 
     if action == "healthcheck":
         return run_healthcheck(selected, db)
@@ -1170,6 +1242,8 @@ def main() -> int:
     if cfg.docker_user:
         plan.append(f"docker as {cfg.docker_user}")
     plan.append(datetime.now().strftime("%Y-%m-%d %H:%M"))
+    if args.auto:
+        plan.append("auto")
     if args.dry_run:
         plan.append(cyan("DRY RUN"))
     say("\n" + dim(" · ").join(plan))
