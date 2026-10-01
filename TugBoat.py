@@ -1,13 +1,19 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
-import json
+import base64
+import fcntl
+import functools
 import grp
+import hashlib
+import json
 import os
 import pwd
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -15,13 +21,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+from http.client import HTTPException
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.1.8"
+__version__ = "0.2.0"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -45,6 +53,7 @@ SYM = {
     "dry":  "○" if UNICODE else "o",
     "bar":  "│" if UNICODE else "|",
     "arrow": "›" if UNICODE else ">",
+    "up":   "↑" if UNICODE else "^",
     "rule": "─" if UNICODE else "-",
 }
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏" if UNICODE else "|/-\\"
@@ -78,7 +87,7 @@ def say(msg: str = "") -> None:
 
 
 def say_error(msg: str) -> None:
-    print(red(f"{SYM['fail']} {msg}"), flush=True)
+    say(red(f"{SYM['fail']} {msg}"))
 
 
 def term_width() -> int:
@@ -146,6 +155,29 @@ class StepOutcome:
     seconds: float
 
 
+CANCEL = threading.Event()
+ACTIVE_PROCS: set[subprocess.Popen] = set()
+
+
+def stop_active(grace: float = 10) -> None:
+    CANCEL.set()
+    procs = list(ACTIVE_PROCS)
+    for proc in procs:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + grace
+    for proc in procs:
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 class Runner:
     def __init__(self, verbose: bool, dry_run: bool):
         self.verbose = verbose
@@ -162,9 +194,12 @@ class Runner:
     def dry(self, label: str, note: str) -> None:
         self._line("dry", label, None, dim(note))
 
-    def step(self, label: str, work: StepWork, warn_only: bool = False) -> StepOutcome:
+    def step(self, label: str, work: StepWork, warn_only: bool = False,
+             timeout: float = 0) -> StepOutcome:
         output: list[str] = []
         result: dict = {}
+        timed_out = False
+        CANCEL.clear()
 
         def emit(line: str) -> None:
             output.append(line)
@@ -185,6 +220,9 @@ class Runner:
         frame = 0
         try:
             while t.is_alive():
+                if timeout and not timed_out and time.monotonic() - start > timeout:
+                    timed_out = True
+                    stop_active()
                 if IS_TTY and not self.verbose:
                     elapsed = fmt_time(time.monotonic() - start)
                     last = output[-1].strip() if output else ""
@@ -193,11 +231,17 @@ class Runner:
                                      f"{label:<20} {dim(f'{elapsed:>7}')}  {dim(last[:room])}")
                     frame += 1
                 t.join(0.1)
+        except KeyboardInterrupt:
+            stop_active()
+            t.join(30)
+            raise
         finally:
             if IS_TTY and not self.verbose:
                 write("\r\033[K")
 
         ok, note, details = result.get("r", (False, "no result", []))
+        if timed_out:
+            ok, note = False, f"timed out after {fmt_time(timeout)}"
         seconds = time.monotonic() - start
         if ok is True:
             status = "ok"
@@ -214,11 +258,18 @@ def command_work(cmd: str, cwd: Path) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
         proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                text=True, errors="replace", bufsize=1, **DOCKER_RUN_AS)
+                                text=True, errors="replace", bufsize=1,
+                                start_new_session=True, **DOCKER_RUN_AS)
         assert proc.stdout is not None
-        for line in proc.stdout:
-            emit(line.rstrip("\n").split("\r")[-1])
-        rc = proc.wait()
+        ACTIVE_PROCS.add(proc)
+        try:
+            for line in proc.stdout:
+                emit(line.rstrip("\n").split("\r")[-1])
+            rc = proc.wait()
+        finally:
+            ACTIVE_PROCS.discard(proc)
+        if CANCEL.is_set():
+            return False, "cancelled", []
         return rc == 0, "" if rc == 0 else f"exit code {rc}", []
     return work
 
@@ -251,9 +302,11 @@ def latest_release(timeout: float = 5) -> dict:
         if e.code == 403:
             raise RuntimeError("GitHub refused the request (rate limit?) - try again later")
         raise RuntimeError(f"GitHub returned HTTP {e.code}")
-    except (URLError, OSError, TimeoutError) as e:
+    except (URLError, OSError, HTTPException) as e:
         raise RuntimeError(f"could not reach GitHub: {getattr(e, 'reason', e)}")
-    except json.JSONDecodeError:
+    except ValueError:
+        raise RuntimeError("unexpected answer from GitHub")
+    if not isinstance(data, dict):
         raise RuntimeError("unexpected answer from GitHub")
     tag = data.get("tag_name") or ""
     return {
@@ -294,8 +347,8 @@ def install_release(rel: dict, dry_run: bool) -> bool:
     say(f"  Downloading {dim(url)}")
     try:
         raw = http_get(url, 30)
-        text = raw.decode("utf-8")
-    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError) as e:
+        text = raw.decode("utf-8-sig")
+    except (URLError, OSError, HTTPException, UnicodeDecodeError) as e:
         say_error(f"Download failed: {getattr(e, 'reason', e)}")
         return False
 
@@ -337,13 +390,14 @@ def install_release(rel: dict, dry_run: bool) -> bool:
 
     try:
         example = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/TugBoat.conf", 10).decode("utf-8")
-        local = set(_conf_keys(CONFIG_FILE.read_text())) if CONFIG_FILE.is_file() else set()
+        local = (set(_conf_keys(CONFIG_FILE.read_text(encoding="utf-8")))
+                 if CONFIG_FILE.is_file() else set())
         new_keys = [k for k in _conf_keys(example) if k not in local]
         if new_keys:
             say(yellow(f"  {SYM['warn']} New config settings (defaults used until you add them): "
                        f"{', '.join(new_keys)}"))
             say(dim(f"    see {__git__}/blob/{rel['tag']}/TugBoat.conf"))
-    except (HTTPError, URLError, OSError, TimeoutError, UnicodeDecodeError):
+    except (URLError, OSError, HTTPException, UnicodeDecodeError):
         pass
     return True
 
@@ -428,6 +482,8 @@ class Config:
     docker_user: str
     update_check: bool
     auto_update: bool
+    image_check: bool
+    command_timeout: int
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -466,7 +522,7 @@ def load_config(path: Path) -> Config:
         raise FileNotFoundError(f"Config file not found: {path}")
 
     raw: dict[str, str] = {}
-    for lineno, line in enumerate(path.read_text().splitlines(), 1):
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -481,11 +537,14 @@ def load_config(path: Path) -> Config:
     if missing:
         raise ValueError(f"Missing required config value(s): {', '.join(missing)}")
 
-    container_path = Path(raw["container_path"]).expanduser()
+    def resolve(value: str | Path) -> Path:
+        return path.parent / Path(value).expanduser()
+
+    container_path = resolve(raw["container_path"])
     return Config(
         container_path=container_path,
         backup=_parse_bool(raw.get("backup", "true"), "backup"),
-        backup_path=raw.get("backup_path", str(container_path / ".backup" / STACK_PLACEHOLDER)),
+        backup_path=str(resolve(raw.get("backup_path") or container_path / ".backup" / STACK_PLACEHOLDER)),
         backup_retention=_parse_int(raw.get("backup_retention", "10"), "backup_retention"),
         up_cmd=raw["docker_stack_up_cmd"],
         down_cmd=raw["docker_stack_down_cmd"],
@@ -497,8 +556,10 @@ def load_config(path: Path) -> Config:
         docker_user=raw.get("docker_user", "").strip(),
         update_check=_parse_bool(raw.get("update_check", "true"), "update_check"),
         auto_update=_parse_bool(raw.get("auto_update", "true"), "auto_update"),
-        status_file=Path(raw.get("status_file") or container_path / "tugboat.json").expanduser(),
+        status_file=resolve(raw.get("status_file") or container_path / "tugboat.json"),
         health_wait=_parse_int(raw.get("health_wait", "60"), "health_wait"),
+        image_check=_parse_bool(raw.get("image_check", "true"), "image_check"),
+        command_timeout=_parse_int(raw.get("command_timeout", "0"), "command_timeout"),
     )
 
 
@@ -544,6 +605,16 @@ def ensure_root(non_interactive: bool = False) -> None:
     say(yellow("Not running as root - restarting with sudo"))
     sudo = ["sudo", "-n"] if non_interactive else ["sudo"]
     os.execvp("sudo", [*sudo, sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+def acquire_run_lock():
+    handle = open(CONFIG_FILE, "rb")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError("Another TugBoat run is changing stacks right now - try again when it is done")
+    return handle
 
 
 def find_stacks(root: Path, ignore: set[str] = frozenset()) -> list[Path]:
@@ -629,16 +700,20 @@ def ask_for_action() -> str | None:
         say(yellow("  Invalid choice, try again."))
 
 
-def ask_for_stacks(stacks: list[Path], action: str, snaps: dict[str, dict] | None = None) -> list[Path]:
+def ask_for_stacks(stacks: list[Path], action: str, snaps: dict[str, dict] | None = None,
+                   db: "StatusDB | None" = None) -> list[Path]:
     title = "check" if action == "healthcheck" else action
     say("\n" + bold(f"Stacks to {title.upper()}"))
     width = max(len(s.name) for s in stacks)
     for i, s in enumerate(stacks, 1):
         snap = (snaps or {}).get(s.name)
+        updates = db.stack(s.name).get("updates_available") if db else 0
+        mark = yellow(f"  {SYM['up']} {fmt_updates(updates)}") if updates else ""
         if snap:
-            _menu_item(str(i), f"{s.name:<{width}}  {HEALTH_STYLE[snap['health']][1](snap['health'])}")
+            health = HEALTH_STYLE[snap["health"]][1](f"{snap['health']:<9}")
+            _menu_item(str(i), f"{s.name:<{width}}  {health}{mark}".rstrip())
         else:
-            _menu_item(str(i), s.name)
+            _menu_item(str(i), f"{s.name:<{width}}{mark}".rstrip())
     _menu_item("a", bold("ALL stacks"))
     _menu_item("q", dim("Quit"))
     say(dim("  e.g. 1,3 or 2-4"))
@@ -666,24 +741,76 @@ def new_backup_dest(stack: Path, cfg: Config) -> Path:
     return dest
 
 
+def backup_inside_stack(stack: Path, cfg: Config) -> bool:
+    try:
+        cfg.backup_root(stack.name).resolve().relative_to(stack.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_special(path: str) -> bool:
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return False
+    return stat.S_ISSOCK(mode) or stat.S_ISFIFO(mode) or stat.S_ISBLK(mode) or stat.S_ISCHR(mode)
+
+
+def _copy_file(src: str, dst: str, *, follow_symlinks: bool = True) -> str:
+    if CANCEL.is_set():
+        raise InterruptedError("cancelled")
+    shutil.copyfile(src, dst, follow_symlinks=follow_symlinks)
+    st = os.lstat(src)
+    try:
+        os.chown(dst, st.st_uid, st.st_gid, follow_symlinks=False)
+    except PermissionError:
+        pass
+    shutil.copystat(src, dst, follow_symlinks=follow_symlinks)
+    return dst
+
+
+def _copy_dir_owners(src: Path, dest: Path) -> None:
+    for root, dirs, files in os.walk(dest):
+        origin = os.path.normpath(os.path.join(src, os.path.relpath(root, dest)))
+        names = ["."] + dirs + [f for f in files if os.path.islink(os.path.join(root, f))]
+        for name in names:
+            try:
+                st = os.lstat(os.path.join(origin, name))
+                os.chown(os.path.join(root, name), st.st_uid, st.st_gid, follow_symlinks=False)
+            except OSError:
+                pass
+
+
 def backup_work(stack: Path, dest: Path) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
         emit(f"copying {stack} -> {dest}")
+        skipped: list[str] = []
+
+        def ignore(folder: str, names: list[str]) -> list[str]:
+            special = [n for n in names if _is_special(os.path.join(folder, n))]
+            for n in special:
+                skipped.append(os.path.join(folder, n))
+                emit(f"skipping socket/pipe/device {os.path.join(folder, n)}")
+            return special
+
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(stack, dest, symlinks=True)
+            shutil.copytree(stack, dest, symlinks=True, ignore=ignore, copy_function=_copy_file)
+            _copy_dir_owners(stack, dest)
             try:
                 shown = str(dest.relative_to(stack.parent))
             except ValueError:
                 shown = str(dest)
-            return True, f"{SYM['arrow']} {shown}", []
+            extra = f" ({len(skipped)} socket/pipe file(s) skipped)" if skipped else ""
+            return True, f"{SYM['arrow']} {shown}{extra}", []
         except shutil.Error as e:
             failures = e.args[0] if e.args and isinstance(e.args[0], list) else []
             details = [f"{src}: {str(reason).split(']')[-1].split(':')[0].strip()}"
                        for src, _, reason in failures[:10]]
             if len(failures) > 10:
                 details.append(f"... and {len(failures) - 10} more")
-            note = f"{len(failures)} file(s) could not be copied"
+            note = "cancelled" if CANCEL.is_set() else f"{len(failures)} file(s) could not be copied"
         except OSError as e:
             details, note = [], str(e)
         shutil.rmtree(dest, ignore_errors=True)
@@ -723,17 +850,25 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def compose_ps(stack: Path) -> tuple[list[dict] | None, str]:
+def docker(args: list[str], cwd: Path | None = None, timeout: float = 60) -> tuple[int, str, str]:
     try:
-        p = subprocess.run(["docker", "compose", "ps", "--all", "--format", "json"], cwd=stack,
-                           capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
-                           **DOCKER_RUN_AS)
+        p = subprocess.run(["docker", *args], cwd=cwd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, stdin=subprocess.DEVNULL, **DOCKER_RUN_AS)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return None, str(e)
-    if p.returncode != 0:
-        msg = (p.stderr or p.stdout).strip().splitlines()
-        return None, msg[-1] if msg else f"docker compose ps exit code {p.returncode}"
-    text = p.stdout.strip()
+        return -1, "", str(e)
+    return p.returncode, p.stdout, p.stderr
+
+
+def _last_line(text: str, fallback: str) -> str:
+    lines = text.strip().splitlines()
+    return lines[-1].strip() if lines else fallback
+
+
+def compose_ps(stack: Path) -> tuple[list[dict] | None, str]:
+    rc, out, err = docker(["compose", "ps", "--all", "--format", "json"], cwd=stack)
+    if rc != 0:
+        return None, _last_line(err or out, f"docker compose ps exit code {rc}")
+    text = out.strip()
     if not text:
         return [], ""
     try:
@@ -799,14 +934,13 @@ def problem_logs(stack: Path, snapshot: dict, tail: int = 15) -> list[str]:
            if c["service"] and any(p.startswith((c["name"] or c["service"]) + ":") for p in snapshot["problems"])}
     lines: list[str] = []
     for service in sorted(bad):
-        try:
-            p = subprocess.run(["docker", "compose", "logs", "--no-color", "--tail", str(tail), service],
-                               cwd=stack, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
-                               **DOCKER_RUN_AS)
-            lines.append(f"-- logs: {service} (last {tail} lines) --")
-            lines += [l for l in (p.stdout + p.stderr).splitlines() if l.strip()]
-        except (OSError, subprocess.TimeoutExpired) as e:
-            lines.append(f"-- logs: {service}: {e}")
+        rc, out, err = docker(["compose", "logs", "--no-color", "--tail", str(tail), service],
+                              cwd=stack, timeout=30)
+        if rc == -1:
+            lines.append(f"-- logs: {service}: {err}")
+            continue
+        lines.append(f"-- logs: {service} (last {tail} lines) --")
+        lines += [l for l in (out + err).splitlines() if l.strip()]
     return lines
 
 
@@ -821,7 +955,8 @@ def health_work(stack: Path, cfg: Config, res: StackResult) -> StepWork:
                 last = snap["summary"]
             if snap["health"] != "starting" or time.monotonic() >= deadline:
                 break
-            time.sleep(3)
+            if CANCEL.wait(3):
+                break
         res.health = snap
         h = snap["health"]
         if h == "healthy":
@@ -838,34 +973,379 @@ def health_work(stack: Path, cfg: Config, res: StackResult) -> StepWork:
     return work
 
 
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_REPO_PART = r"[a-z0-9]+(?:(?:\.|_{1,2}|-+)[a-z0-9]+)*"
+REPO_RE = re.compile(rf"{_REPO_PART}(?:/{_REPO_PART})*")
+TAG_RE = re.compile(r"\w[\w.-]{0,127}")
+DOCKER_HUB = "docker.io"
+DOCKER_HUB_ALIASES = (DOCKER_HUB, "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com")
+MANIFEST_TYPES = ", ".join((
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+))
+REGISTRY_TIMEOUT = 10
+IMAGE_OUTDATED = ("update_available", "not_pulled")
+
+
+class RegistryError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ImageRef:
+    registry: str
+    repo: str
+    tag: str
+    digest: str
+
+
+def parse_image_ref(image: str) -> ImageRef | None:
+    name, _, digest = image.strip().partition("@")
+    first, slash, rest = name.partition("/")
+    if slash and ("." in first or ":" in first or first == "localhost"):
+        registry, path = first.lower(), rest
+    else:
+        registry, path = DOCKER_HUB, name
+    path, colon, tag = path.partition(":")
+    if registry in DOCKER_HUB_ALIASES:
+        registry = DOCKER_HUB
+        if "/" not in path:
+            path = "library/" + path
+    if not REPO_RE.fullmatch(path) or (colon and not TAG_RE.fullmatch(tag)):
+        return None
+    if digest and not DIGEST_RE.fullmatch(digest):
+        return None
+    return ImageRef(registry, path, tag or ("" if digest else "latest"), digest)
+
+
+def _registry_of(key: str) -> str:
+    host = re.sub(r"^[a-z]+://", "", key.strip().lower()).split("/")[0]
+    return DOCKER_HUB if host in DOCKER_HUB_ALIASES else host
+
+
+@functools.lru_cache(maxsize=None)
+def docker_cli_config() -> dict:
+    home = DOCKER_RUN_AS.get("env", {}).get("HOME") or Path.home()
+    folder = os.environ.get("DOCKER_CONFIG") or Path(home) / ".docker"
+    try:
+        data = json.loads((Path(folder) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _credential_helper(helper: str, server: str) -> tuple[str, str] | None:
+    if not re.fullmatch(r"[\w.-]+", helper):
+        return None
+    try:
+        p = subprocess.run([f"docker-credential-{helper}", "get"], input=server, capture_output=True,
+                           text=True, timeout=10, **DOCKER_RUN_AS)
+        data = json.loads(p.stdout)
+        user, secret = data.get("Username"), data.get("Secret")
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return None
+    return (user, secret) if user and secret and user != "<token>" else None
+
+
+def registry_credentials(registry: str) -> tuple[str, str] | None:
+    conf = docker_cli_config()
+    auths = conf.get("auths") if isinstance(conf.get("auths"), dict) else {}
+    helpers = conf.get("credHelpers") if isinstance(conf.get("credHelpers"), dict) else {}
+    helper = next((h for k, h in helpers.items() if _registry_of(k) == registry), None) or conf.get("credsStore")
+    servers = [k for k in auths if _registry_of(k) == registry]
+    for key in servers:
+        entry = auths[key]
+        if isinstance(entry, dict) and entry.get("auth"):
+            try:
+                user, _, password = base64.b64decode(entry["auth"]).decode("utf-8").partition(":")
+            except ValueError:
+                continue
+            if user and password:
+                return user, password
+    if isinstance(helper, str):
+        for server in servers or ["https://index.docker.io/v1/" if registry == DOCKER_HUB else registry]:
+            creds = _credential_helper(helper, server)
+            if creds:
+                return creds
+    return None
+
+
+def _http_open(url: str, timeout: float, method: str = "GET", headers: dict | None = None):
+    req = Request(url, method=method, headers={"User-Agent": f"{__title__}/{__version__}", **(headers or {})})
+    return urlopen(req, timeout=timeout)
+
+
+def _registry_auth(challenge: str, ref: ImageRef, timeout: float) -> str:
+    scheme, _, rest = challenge.strip().partition(" ")
+    params = dict(re.findall(r'(\w+)="([^"]*)"', rest))
+    creds = registry_credentials(ref.registry)
+    basic = "Basic " + base64.b64encode(":".join(creds).encode()).decode() if creds else ""
+    if scheme.lower() == "basic":
+        if not basic:
+            raise RegistryError("login required (docker login)")
+        return basic
+    realm = params.get("realm", "")
+    if scheme.lower() != "bearer" or not realm.startswith(("https://", "http://")):
+        raise RegistryError("registry uses an authentication method TugBoat does not know")
+    query = {"scope": params.get("scope") or f"repository:{ref.repo}:pull"}
+    if params.get("service"):
+        query["service"] = params["service"]
+    url = realm + ("&" if "?" in realm else "?") + urlencode(query)
+    attempts = [{"Authorization": basic}, {}] if basic and realm.startswith("https://") else [{}]
+    for i, headers in enumerate(attempts):
+        try:
+            with _http_open(url, timeout, headers=headers) as r:
+                data = json.loads(r.read())
+            token = data.get("token") or data.get("access_token") if isinstance(data, dict) else None
+            if token:
+                return f"Bearer {token}"
+            raise RegistryError("registry gave no access token")
+        except HTTPError as e:
+            if e.code not in (401, 403) or i == len(attempts) - 1:
+                raise
+    raise RegistryError("registry gave no access token")
+
+
+_REGISTRY_TOKENS: dict[tuple[str, str], str] = {}
+
+
+def _manifest_digest(url: str, ref: ImageRef, timeout: float) -> str:
+    key = (ref.registry, ref.repo)
+    headers = {"Accept": MANIFEST_TYPES}
+    if key in _REGISTRY_TOKENS:
+        headers["Authorization"] = _REGISTRY_TOKENS[key]
+    authed = False
+    methods = ["HEAD", "GET"]
+    while methods:
+        try:
+            with _http_open(url, timeout, methods[0], headers) as r:
+                digest = r.headers.get("Docker-Content-Digest") or ""
+                if DIGEST_RE.fullmatch(digest):
+                    return digest
+                if methods[0] == "GET":
+                    return "sha256:" + hashlib.sha256(r.read()).hexdigest()
+        except HTTPError as e:
+            if e.code == 401 and not authed:
+                authed = True
+                headers["Authorization"] = _registry_auth(e.headers.get("WWW-Authenticate") or "", ref, timeout)
+                _REGISTRY_TOKENS[key] = headers["Authorization"]
+                continue
+            if methods[0] == "GET" or e.code not in (400, 405, 501):
+                raise
+        methods.pop(0)
+    raise RegistryError("registry did not return a digest")
+
+
+def remote_digest(ref: ImageRef, timeout: float = REGISTRY_TIMEOUT) -> str:
+    host = "registry-1.docker.io" if ref.registry == DOCKER_HUB else ref.registry
+    local = host.split(":")[0] in ("localhost", "127.0.0.1")
+    problem = "no answer"
+    for scheme in ("https", "http") if local else ("https",):
+        try:
+            return _manifest_digest(f"{scheme}://{host}/v2/{ref.repo}/manifests/{ref.tag}", ref, timeout)
+        except HTTPError as e:
+            raise RegistryError({
+                401: "access denied - private image? (docker login)",
+                403: "access denied - private image? (docker login)",
+                404: "image or tag not found in the registry",
+                429: "rate limited by the registry",
+            }.get(e.code, f"registry returned HTTP {e.code}"))
+        except (URLError, OSError, HTTPException, ValueError) as e:
+            problem = f"could not reach {host}: {getattr(e, 'reason', e)}"
+    raise RegistryError(problem)
+
+
+def local_image(image: str) -> tuple[str, set[str]] | None:
+    rc, out, err = docker(["image", "inspect", "--format", "{{.Id}}\t{{json .RepoDigests}}", image])
+    if rc != 0:
+        if "no such" in err.lower():
+            return None
+        raise RegistryError(_last_line(err, f"docker image inspect exit code {rc}"))
+    image_id, _, digests = out.strip().partition("\t")
+    try:
+        repo_digests = json.loads(digests) or []
+    except ValueError:
+        repo_digests = []
+    return image_id, {d.rpartition("@")[2] for d in repo_digests if "@" in d}
+
+
+def inspect_image(image: str, built: bool) -> dict:
+    info = {"status": "unknown", "local_digest": "", "remote_digest": "", "detail": "", "id": ""}
+    try:
+        local = local_image(image)
+        ref = parse_image_ref(image)
+        if built:
+            info.update(status="local", detail="built from a Dockerfile")
+        elif ref is None:
+            info["detail"] = "could not understand the image name"
+        elif ref.digest and local is None:
+            info.update(status="not_pulled", local_digest="", remote_digest=ref.digest, detail="not pulled yet")
+        elif local is None:
+            info.update(remote_digest=remote_digest(ref), status="not_pulled", detail="not pulled yet")
+        elif ref.digest:
+            info.update(status="pinned", local_digest=ref.digest, detail="pinned to a digest")
+        elif not local[1]:
+            info.update(status="local", detail="not from a registry (built or loaded locally)")
+        else:
+            remote = remote_digest(ref)
+            info["remote_digest"] = remote
+            info["local_digest"] = remote if remote in local[1] else sorted(local[1])[0]
+            info["status"] = "up_to_date" if remote in local[1] else "update_available"
+        if local:
+            info["id"] = local[0]
+    except RegistryError as e:
+        info["detail"] = str(e)
+    return info
+
+
+def declared_images(stack: Path, containers: list[dict]) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+
+    def add(image: str, service: str, built: bool) -> None:
+        entry = found.setdefault(image, {"services": [], "built": False})
+        if service and service not in entry["services"]:
+            entry["services"].append(service)
+        entry["built"] = entry["built"] or built
+
+    rc, out, _ = docker(["compose", "config", "--format", "json"], cwd=stack)
+    try:
+        services = json.loads(out).get("services") if rc == 0 else None
+    except (ValueError, AttributeError):
+        services = None
+    if isinstance(services, dict):
+        for name, spec in services.items():
+            if isinstance(spec, dict) and spec.get("image"):
+                add(str(spec["image"]), name, "build" in spec)
+        return found
+    for c in containers:
+        if c["image"]:
+            add(c["image"], c["service"], False)
+    return found
+
+
+def running_image_ids(containers: list[dict]) -> dict[str, set[str]]:
+    names = [c["name"] for c in containers if c["name"]]
+    ids: dict[str, set[str]] = {}
+    if not names:
+        return ids
+    _, out, _ = docker(["inspect", "--type", "container", "--format", "{{.Config.Image}}\t{{.Image}}", *names])
+    for line in out.splitlines():
+        image, _, image_id = line.strip().partition("\t")
+        if image and image_id:
+            ids.setdefault(image, set()).add(image_id)
+    return ids
+
+
+def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False) -> dict[str, dict]:
+    busy = IS_TTY and not quiet
+    if busy:
+        write(f"  {cyan(SPINNER[0])} {dim('Checking registries for new images...')}")
+
+    def gather(stack: Path) -> tuple[dict[str, dict], dict[str, set[str]]]:
+        containers = snaps.get(stack.name, {}).get("containers") or []
+        return declared_images(stack, containers), running_image_ids(containers)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        gathered = dict(zip((s.name for s in stacks), pool.map(gather, stacks)))
+        wanted: dict[str, bool] = {}
+        for declared, _ in gathered.values():
+            for image, entry in declared.items():
+                wanted[image] = wanted.get(image, False) or entry["built"]
+        checked = dict(zip(wanted, pool.map(lambda image: inspect_image(image, wanted[image]), wanted)))
+    if busy:
+        write("\r\033[K")
+
+    result: dict[str, dict] = {}
+    for name, (declared, in_use) in gathered.items():
+        images = []
+        for image, entry in sorted(declared.items()):
+            info = dict(checked[image], image=image, services=sorted(entry["services"]))
+            image_id = info.pop("id")
+            if info["status"] == "up_to_date" and in_use.get(image) and image_id not in in_use[image]:
+                info.update(status="update_available", detail="new image is pulled, containers still run the old one")
+            images.append({k: info[k] for k in ("image", "services", "status", "local_digest",
+                                                "remote_digest", "detail")})
+        result[name] = {
+            "images": images,
+            "updates_available": sum(i["status"] in IMAGE_OUTDATED for i in images),
+            "images_checked_at": now_iso(),
+        }
+    return result
+
+
+def fmt_updates(count: int) -> str:
+    return f"{count} image update{'s' if count != 1 else ''}"
+
+
+def print_image_report(stacks: list[Path], images: dict[str, dict]) -> None:
+    rows = [(s.name, i) for s in stacks for i in images.get(s.name, {}).get("images", [])]
+    outdated = [(n, i) for n, i in rows if i["status"] in IMAGE_OUTDATED]
+    unknown = [(n, i) for n, i in rows if i["status"] == "unknown"]
+    width = max((len(n) for n, _ in outdated + unknown), default=0)
+    iwidth = max((len(i["image"]) for _, i in outdated + unknown), default=0)
+    if outdated:
+        rule(f"Image updates ({len(outdated)})")
+        for name, i in outdated:
+            note = i["detail"] or f"{i['local_digest'][7:19]} {SYM['arrow']} {i['remote_digest'][7:19]}"
+            say(f"  {yellow(SYM['up'])} {name:<{width}}  {i['image']:<{iwidth}}  {dim(note)}")
+    if unknown:
+        rule(f"Images not checked ({len(unknown)})")
+        for name, i in unknown:
+            say(f"  {yellow(SYM['warn'])} {name:<{width}}  {i['image']:<{iwidth}}  {dim(i['detail'])}")
+    if rows and not outdated and not unknown:
+        say("\n  " + green(f"{SYM['ok']} All {len(rows)} image(s) are up to date"))
+
+
 class StatusDB:
 
     def __init__(self, path: Path):
         self.path = path
-        self.data: dict = {"stacks": {}}
-        if path.is_file():
+        self.data = self._load(warn=True)
+        self._changes: dict[str, dict] = {}
+        self._known: set[str] | None = None
+
+    def _load(self, warn: bool) -> dict:
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            loaded = None
+        except ValueError:
+            loaded = None
+            broken = self.path.with_name(self.path.name + ".broken")
+            if warn:
+                say(yellow(f"{self.path.name} is not valid JSON - starting fresh (old file kept as {broken.name})"))
             try:
-                loaded = json.loads(path.read_text())
-                if isinstance(loaded, dict) and isinstance(loaded.get("stacks"), dict):
-                    self.data = loaded
-            except (OSError, json.JSONDecodeError):
-                broken = path.with_name(path.name + ".broken")
-                say(yellow(f"{path.name} could not be read - starting fresh (old file kept as {broken.name})"))
-                try:
-                    path.replace(broken)
-                except OSError:
-                    pass
+                self.path.replace(broken)
+            except OSError:
+                pass
+        except OSError as e:
+            loaded = None
+            if warn:
+                say(yellow(f"{self.path.name} could not be read ({e.strerror or e}) - starting fresh"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("stacks"), dict):
+            return loaded
+        return {"stacks": {}}
 
     def stack(self, name: str) -> dict:
-        return self.data["stacks"].setdefault(name, {})
+        entry = self.data["stacks"].get(name)
+        return entry if isinstance(entry, dict) else {}
+
+    def _set(self, name: str, values: dict) -> None:
+        if not isinstance(self.data["stacks"].get(name), dict):
+            self.data["stacks"][name] = {}
+        self.data["stacks"][name].update(values)
+        self._changes.setdefault(name, {}).update(values)
 
     def set_health(self, name: str, snapshot: dict) -> None:
-        entry = self.stack(name)
-        entry.update({k: snapshot[k] for k in ("health", "summary", "problems", "checked_at", "containers")})
+        self._set(name, {k: snapshot[k] for k in ("health", "summary", "problems", "checked_at", "containers")})
+
+    def set_images(self, name: str, images: dict) -> None:
+        self._set(name, {k: images[k] for k in ("images", "updates_available", "images_checked_at")})
 
     def set_action(self, res: StackResult, action: str) -> None:
-        entry = self.stack(res.name)
-        entry["last_action"] = {
+        values: dict = {"last_action": {
             "action": action,
             "ok": res.ok,
             "result": res.status,
@@ -873,25 +1353,45 @@ class StatusDB:
             "duration_s": round(res.seconds, 1),
             "errors": [f"{e.step}: {e.message}" for e in res.errors],
             "warnings": [f"{w.step}: {w.message}" for w in res.warnings],
-        }
+        }}
         if res.backup:
-            entry["last_backup"] = res.backup
+            values["last_backup"] = res.backup
         if action == "update" and res.ok:
-            entry["last_update"] = now_iso()
+            values["last_update"] = now_iso()
+        self._set(res.name, values)
 
     def forget_missing(self, existing: list[Path]) -> None:
-        names = {s.name for s in existing}
+        self._known = {s.name for s in existing}
         for name in list(self.data["stacks"]):
-            if name not in names:
+            if name not in self._known:
                 del self.data["stacks"][name]
 
     def save(self) -> None:
-        self.data["tugboat_version"] = __version__
-        self.data["written_at"] = now_iso()
-        self.data["stacks"] = dict(sorted(self.data["stacks"].items(), key=lambda kv: kv[0].lower()))
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2) + "\n")
-        os.replace(tmp, self.path)
+        data = self._load(warn=False)
+        for name, values in self._changes.items():
+            if not isinstance(data["stacks"].get(name), dict):
+                data["stacks"][name] = {}
+            data["stacks"][name].update(values)
+        stacks = {n: e for n, e in data["stacks"].items()
+                  if isinstance(e, dict) and (self._known is None or n in self._known)}
+        data["stacks"] = dict(sorted(stacks.items(), key=lambda kv: kv[0].lower()))
+        summary: dict[str, int] = {"stacks": len(stacks)}
+        for entry in stacks.values():
+            if entry.get("health"):
+                summary[entry["health"]] = summary.get(entry["health"], 0) + 1
+        summary["updates_available"] = sum(e.get("updates_available") or 0 for e in stacks.values())
+        data["summary"] = summary
+        data["tugboat_version"] = __version__
+        data["written_at"] = now_iso()
+        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+        self.data = data
+        self._changes = {}
 
 
 HEALTH_STYLE = {
@@ -928,7 +1428,8 @@ def fmt_ago(iso: str | None) -> str:
     return ""
 
 
-def print_health_table(stacks: list[Path], snaps: dict[str, dict], db: StatusDB | None) -> None:
+def print_health_table(stacks: list[Path], snaps: dict[str, dict], db: StatusDB | None,
+                       images: dict[str, dict] | None = None) -> None:
     width = max(len(s.name) for s in stacks)
     swidth = max(len(snaps[s.name]["summary"]) for s in stacks)
     for stack in stacks:
@@ -940,6 +1441,9 @@ def print_health_table(stacks: list[Path], snaps: dict[str, dict], db: StatusDB 
         last = db.stack(stack.name).get("last_update") if db else None
         if last:
             extra.append(dim(f"updated {fmt_ago(last)}"))
+        known = images.get(stack.name, {}) if images is not None else db.stack(stack.name) if db else {}
+        if known.get("updates_available"):
+            extra.append(yellow(f"{SYM['up']} {fmt_updates(known['updates_available'])}"))
         if snap["problems"]:
             more = f" (+{len(snap['problems']) - 1} more)" if len(snap["problems"]) > 1 else ""
             extra.append(style(snap["problems"][0] + more))
@@ -958,26 +1462,29 @@ def show_overview(stacks: list[Path], db: StatusDB | None) -> dict[str, dict]:
     print_health_table(stacks, snaps, db)
     say("\n  " + dim(" · ").join(parts))
     if db:
+        for name, snap in snaps.items():
+            db.set_health(name, snap)
         try:
-            for name, snap in snaps.items():
-                db.set_health(name, snap)
             db.save()
         except OSError:
             pass
     return snaps
 
 
-def run_healthcheck(selected: list[Path], db: StatusDB | None) -> int:
+def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool) -> int:
     say("\n" + dim(" · ").join([bold("HEALTH CHECK"),
                                 f"{len(selected)} stack{'s' if len(selected) > 1 else ''}",
                                 datetime.now().strftime("%Y-%m-%d %H:%M")]))
     rule("Stacks")
     snaps = check_all(selected)
-    print_health_table(selected, snaps, db)
+    images = check_images(selected, snaps) if image_check else None
+    print_health_table(selected, snaps, db, images)
     bad = [(s.name, snaps[s.name]) for s in selected if snaps[s.name]["problems"]]
     if db:
         for name, snap in snaps.items():
             db.set_health(name, snap)
+        for name, found in (images or {}).items():
+            db.set_images(name, found)
 
     if bad:
         rule(f"Problems ({len(bad)})")
@@ -985,11 +1492,19 @@ def run_healthcheck(selected: list[Path], db: StatusDB | None) -> int:
             say(f"\n  {red(SYM['fail'])} {bold(name)}")
             for p in snap["problems"]:
                 say(f"      {p}")
+    if images is not None:
+        print_image_report(selected, images)
+    code = 1 if bad else 0
     if db:
-        db.save()
-        say("\n" + dim(f"Status written to {db.path}"))
+        try:
+            db.save()
+            say("\n" + dim(f"Status written to {db.path}"))
+        except OSError as e:
+            say()
+            say_error(f"Could not write {db.path}: {e.strerror or e}")
+            code = code or 2
     say()
-    return 1 if bad else 0
+    return code
 
 
 def _fail(res: StackResult, step: str, out: StepOutcome, status: str) -> StackResult:
@@ -1006,7 +1521,7 @@ def start_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
         res.status = "would start"
         return res
-    out = ui.step("Start", command_work(cfg.start_cmd, stack))
+    out = ui.step("Start", command_work(cfg.start_cmd, stack), timeout=cfg.command_timeout)
     if not out.ok:
         return _fail(res, "Start", out, "start failed")
     out = ui.step("Health check", health_work(stack, cfg, res))
@@ -1024,15 +1539,31 @@ def stop_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
         ui.dry("Stop", f"would run: {cfg.down_cmd}")
         res.status = "would stop"
         return res
-    out = ui.step("Stop", command_work(cfg.down_cmd, stack))
+    out = ui.step("Stop", command_work(cfg.down_cmd, stack), timeout=cfg.command_timeout)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed")
     res.status = "stopped"
     return res
 
 
+def _restart_old(stack: Path, cfg: Config, ui: Runner, res: StackResult, what: str) -> StackResult:
+    restart = ui.step("Restart old version", command_work(cfg.restore_cmd, stack), timeout=cfg.command_timeout)
+    if restart.ok:
+        res.status = f"{what} failed, old version restarted"
+    else:
+        _fail(res, "Restart old version", restart, f"{what} AND restart failed - stack is DOWN")
+    return res
+
+
 def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> StackResult:
     res = StackResult(stack.name)
+
+    if do_backup and backup_inside_stack(stack, cfg):
+        note = f"backup_path {cfg.backup_root(stack.name)} is inside the stack folder"
+        ui._line("fail", "Backup", None, red(note))
+        res.ok, res.status = False, "not updated"
+        res.errors.append(Issue(res.name, "Backup", note, ["Change backup_path in TugBoat.conf."]))
+        return res
 
     if ui.dry_run:
         ui.dry("Stop", f"would run: {cfg.down_cmd}")
@@ -1046,7 +1577,7 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         res.status = "would update"
         return res
 
-    out = ui.step("Stop", command_work(cfg.down_cmd, stack))
+    out = ui.step("Stop", command_work(cfg.down_cmd, stack), timeout=cfg.command_timeout)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
 
@@ -1057,12 +1588,7 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
             res.backup = str(dest)
         if not out.ok:
             _fail(res, "Backup", out, "backup failed")
-            restart = ui.step("Restart old version", command_work(cfg.restore_cmd, stack))
-            if restart.ok:
-                res.status = "backup failed, old version restarted"
-            else:
-                _fail(res, "Restart old version", restart, "backup AND restart failed - stack is DOWN")
-            return res
+            return _restart_old(stack, cfg, ui, res, "backup")
         if cfg.backup_retention > 0:
             out = ui.step("Prune backups", prune_work(stack, cfg), warn_only=True)
             if not out.ok:
@@ -1072,9 +1598,10 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
     else:
         ui.skip("Backup", "skipped")
 
-    out = ui.step("Pull & start", command_work(cfg.up_cmd, stack))
+    out = ui.step("Pull & start", command_work(cfg.up_cmd, stack), timeout=cfg.command_timeout)
     if not out.ok:
-        return _fail(res, "Pull & start", out, "update/start failed - check the stack")
+        _fail(res, "Pull & start", out, "update failed")
+        return _restart_old(stack, cfg, ui, res, "update")
 
     out = ui.step("Health check", health_work(stack, cfg, res))
     if out.warn:
@@ -1137,7 +1664,14 @@ def print_report(results: list[StackResult], pending: list[str], action: str,
     say()
 
 
+def _on_sigterm(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
 def main() -> int:
+    if sys.version_info < (3, 9):
+        say_error(f"{__title__} needs Python 3.9 or newer (this is {sys.version.split()[0]})")
+        return 2
     parser = argparse.ArgumentParser(
         description="Manage Docker Compose stacks.",
         epilog="Stack names are folder names. Give them after the action or with --stack. "
@@ -1148,7 +1682,8 @@ def main() -> int:
     mode.add_argument("--start", nargs="*", metavar="STACK", help="start (docker_stack_start_cmd)")
     mode.add_argument("--stop", nargs="*", metavar="STACK", help="stop (docker_stack_down_cmd)")
     mode.add_argument("--healthcheck", nargs="*", metavar="STACK",
-                      help="check status/health and write the status file (all stacks if no names)")
+                      help="check status/health and new image versions, write the status file "
+                           "(all stacks if no names)")
     mode.add_argument("--check-update", action="store_true",
                       help="check GitHub for a newer TugBoat release")
     mode.add_argument("--self-update", action="store_true",
@@ -1159,14 +1694,28 @@ def main() -> int:
                         help="run the action on all stacks (on its own: update all)")
     parser.add_argument("--auto", action="store_true",
                         help="no questions: default action update, all stacks unless named, confirm everything")
+    parser.add_argument("--only-outdated", action="store_true",
+                        help="update only stacks that have a new image version (update only)")
     parser.add_argument("--skip-backup", action="store_true", help="skip the backup step (update only)")
+    parser.add_argument("--no-image-check", action="store_true",
+                        help="do not ask the registries for new image versions")
     parser.add_argument("-v", "--verbose", action="store_true", help="show full command output live")
     parser.add_argument("--dry-run", action="store_true", help="show actions without running them")
     parser.add_argument("--version", action="version",
                         version=f"{__title__} {__version__} - {__author__} - {__git__}")
     args = parser.parse_args()
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     try:
+        if args.check_update:
+            banner()
+            return run_check_update()
+        if args.self_update:
+            script = Path(__file__).resolve()
+            if not args.dry_run and not (os.access(script, os.W_OK) and os.access(script.parent, os.W_OK)):
+                ensure_root()
+            banner()
+            return run_self_update(args.dry_run)
         cfg = load_config(CONFIG_FILE)
         if cfg.require_root and not args.dry_run:
             ensure_root(non_interactive=args.auto)
@@ -1174,10 +1723,6 @@ def main() -> int:
         user_warning = setup_docker_user(cfg.docker_user)
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
-        if args.check_update:
-            return run_check_update()
-        if args.self_update:
-            return run_self_update(args.dry_run)
         startup_update_check(cfg, args.dry_run)
         stacks = find_stacks(cfg.container_path, cfg.ignore_folders)
     except (OSError, ValueError) as e:
@@ -1199,14 +1744,17 @@ def main() -> int:
     if action is None and (args.all or args.auto):
         action = "update"
 
+    if names and args.all:
+        say_error("Give stack names or --all, not both.")
+        return 2
+    if args.only_outdated and action not in (None, "update"):
+        say_error("--only-outdated only works with --update.")
+        return 2
+
     db: StatusDB | None = None
     if not args.dry_run:
         db = StatusDB(cfg.status_file)
         db.forget_missing(stacks)
-
-    if names and args.all:
-        say_error("Give stack names or --all, not both.")
-        return 2
 
     snaps: dict[str, dict] | None = None
     if action is None:
@@ -1225,13 +1773,22 @@ def main() -> int:
     elif args.all or args.auto or action == "healthcheck":
         selected = stacks
     else:
-        selected = ask_for_stacks(stacks, action, snaps)
+        selected = ask_for_stacks(stacks, action, snaps, db)
     if not selected:
         say(dim("Nothing selected, exiting."))
         return 0
 
+    image_check = cfg.image_check and not args.no_image_check
     if action == "healthcheck":
-        return run_healthcheck(selected, db)
+        return run_healthcheck(selected, db, image_check)
+
+    lock = None
+    if not args.dry_run:
+        try:
+            lock = acquire_run_lock()
+        except (OSError, RuntimeError) as e:
+            say_error(str(e))
+            return 2
 
     do_backup = cfg.backup and not args.skip_backup
     ui = Runner(verbose=args.verbose, dry_run=args.dry_run)
@@ -1239,6 +1796,8 @@ def main() -> int:
     plan = [bold(action.upper()), f"{len(selected)} stack{'s' if len(selected) > 1 else ''}"]
     if action == "update":
         plan.append(f"backup {'on' if do_backup else yellow('off')}")
+        if args.only_outdated:
+            plan.append("only outdated")
     if cfg.docker_user:
         plan.append(f"docker as {cfg.docker_user}")
     plan.append(datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -1247,6 +1806,35 @@ def main() -> int:
     if args.dry_run:
         plan.append(cyan("DRY RUN"))
     say("\n" + dim(" · ").join(plan))
+
+    if action == "update" and args.only_outdated:
+        found = check_images(selected, check_all(selected))
+        if db:
+            for name, images in found.items():
+                db.set_images(name, images)
+        rule("New image versions")
+        width = max(len(s.name) for s in selected)
+        outdated: list[Path] = []
+        for stack in selected:
+            states = [i["status"] for i in found[stack.name]["images"]]
+            n = sum(s in IMAGE_OUTDATED for s in states)
+            if n:
+                outdated.append(stack)
+                say(f"  {yellow(SYM['up'])} {stack.name:<{width}}  {yellow(fmt_updates(n))}")
+            elif "unknown" in states:
+                say(f"  {yellow(SYM['warn'])} {stack.name:<{width}}  "
+                    f"{yellow('could not be checked - skipped (run --healthcheck for details)')}")
+            else:
+                say(f"  {dim(SYM['skip'])} {stack.name:<{width}}  {dim('up to date - skipped')}")
+        selected = outdated
+        if not selected:
+            if db:
+                try:
+                    db.save()
+                except OSError:
+                    pass
+            say("\n" + green(f"{SYM['ok']} Nothing to update.") + "\n")
+            return 0
 
     results: list[StackResult] = []
     interrupted = False
@@ -1264,17 +1852,22 @@ def main() -> int:
                 res = update_stack(stack, cfg, do_backup, ui)
         except KeyboardInterrupt:
             res = StackResult(stack.name, ok=False, status="interrupted")
-            res.errors.append(Issue(stack.name, "-", "interrupted by user (Ctrl+C)"))
+            res.errors.append(Issue(stack.name, "-", "interrupted (Ctrl+C or terminated)"))
             interrupted = True
         res.seconds = time.monotonic() - start
         results.append(res)
         if db:
             try:
-                db.set_health(stack.name, res.health or check_health(stack))
+                snap = res.health or check_health(stack)
+                db.set_health(stack.name, snap)
                 db.set_action(res, action)
+                if action == "update" and res.ok and (image_check or args.only_outdated) and not interrupted:
+                    db.set_images(stack.name, check_images([stack], {stack.name: snap}, quiet=True)[stack.name])
                 db.save()
             except OSError as e:
-                res.warnings.append(Issue(stack.name, "Status file", str(e)))
+                res.warnings.append(Issue(stack.name, "Status file", e.strerror or str(e)))
+            except KeyboardInterrupt:
+                interrupted = True
         if interrupted:
             break
 
@@ -1282,6 +1875,7 @@ def main() -> int:
     print_report(results, pending, action, time.monotonic() - run_start, interrupted)
     if db:
         say(dim(f"Status written to {db.path}") + "\n")
+    del lock
 
     if interrupted:
         return 130
@@ -1289,4 +1883,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        say()
+        say_error("Interrupted")
+        sys.exit(130)
