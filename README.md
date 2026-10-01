@@ -5,4 +5,4 @@
   </picture>
 </p>
 
-# TugBoat - easy management and status for multi-stack Docker container setups
+# TugBoat - easy management and monitoring for multi-stack Docker container setups
