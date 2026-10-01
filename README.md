@@ -30,6 +30,7 @@ sudo python3 TugBoat.py --stop --all
 | `--only-outdated` | With an update: skip stacks whose images are already up to date |
 | `--skip-backup` | With an update: do not back up the stack folder first |
 | `--no-image-check` | Do not ask the registries for new image versions |
+| `--check-images` | Ask the registries now, even if `image_check_interval` has not passed |
 | `--dry-run` | Show what would happen, change nothing, write nothing |
 | `-v`, `--verbose` | Show the full output of every command |
 | `--check-update`, `--self-update` | Check for / install a new TugBoat release |
@@ -53,7 +54,9 @@ each image as one of:
 | `unknown` | Could not be checked; `detail` says why |
 
 Only manifest digests are requested, so the check does not pull anything and does not count
-against Docker Hub's pull limit. Private registries use the login of `docker_user`
+against Docker Hub's pull limit. The registries are asked at most once per
+`image_check_interval` (60 minutes) per stack, so the health check can run from cron every minute;
+the same goes for the check for a new TugBoat release, which is done at most once per hour. Private registries use the login of `docker_user`
 (`docker login`). A new image never changes the exit code; only health problems do.
 
 ## Status file
@@ -112,6 +115,7 @@ Settings live in `TugBoat.conf` next to the script. Relative paths are relative 
 | `status_file` | `<container_path>/tugboat.json` | Where the status file is written |
 | `health_wait` | `60` | Seconds to wait for containers to become healthy after a start |
 | `image_check` | `true` | Check for new image versions during a health check |
+| `image_check_interval` | `60` | Minutes between registry checks per stack; health checks in between reuse the last result (`0` = every time) |
 | `command_timeout` | `0` | Stop a command that runs longer than this many seconds (`0` = no limit) |
 | `update_check` | `true` | Look for a new TugBoat release at start |
 | `auto_update` | `true` | Install a new TugBoat release automatically |

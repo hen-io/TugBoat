@@ -29,7 +29,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -278,6 +278,7 @@ GITHUB_REPO = __git__.rstrip("/").split("github.com/")[-1]
 GITHUB_API = "https://api.github.com"
 GITHUB_RAW = "https://raw.githubusercontent.com"
 UPDATED_ENV = "TUGBOAT_JUST_UPDATED"
+RELEASE_CHECK_INTERVAL = 3600
 
 
 def parse_version(v: str) -> tuple[int, ...]:
@@ -445,12 +446,25 @@ def run_self_update(dry_run: bool) -> int:
     return 0 if ok else 1
 
 
-def startup_update_check(cfg: "Config", dry_run: bool) -> None:
+def startup_update_check(cfg: "Config", dry_run: bool, db: "StatusDB | None") -> None:
     if not (cfg.update_check or cfg.auto_update) or os.environ.get(UPDATED_ENV):
         if os.environ.get(UPDATED_ENV):
             say(green(f"{SYM['ok']} Updated to {__title__} {__version__}"))
         return
-    _, newer, _ = check_update(timeout=3)
+    cached = db.data.get("release_check") if db else None
+    if isinstance(cached, dict) and is_fresh(cached.get("checked_at"), RELEASE_CHECK_INTERVAL):
+        latest = str(cached.get("latest") or "")
+        if parse_version(latest) > parse_version(__version__):
+            say(yellow(f"{SYM['warn']} {__title__} {latest} is available (you have {__version__}) - "
+                       f"run with --self-update to install"))
+        return
+    rel, newer, _ = check_update(timeout=3)
+    if db:
+        db.set_top("release_check", {"checked_at": now_iso(), "latest": rel["tag"] if rel else ""})
+        try:
+            db.save()
+        except OSError:
+            pass
     if not newer:
         return
     if cfg.auto_update and not dry_run:
@@ -483,6 +497,7 @@ class Config:
     update_check: bool
     auto_update: bool
     image_check: bool
+    image_check_interval: int
     command_timeout: int
 
     def backup_root(self, stack: str) -> Path:
@@ -559,6 +574,7 @@ def load_config(path: Path) -> Config:
         status_file=resolve(raw.get("status_file") or container_path / "tugboat.json"),
         health_wait=_parse_int(raw.get("health_wait", "60"), "health_wait"),
         image_check=_parse_bool(raw.get("image_check", "true"), "image_check"),
+        image_check_interval=_parse_int(raw.get("image_check_interval", "60"), "image_check_interval"),
         command_timeout=_parse_int(raw.get("command_timeout", "0"), "command_timeout"),
     )
 
@@ -848,6 +864,19 @@ def prune_work(stack: Path, cfg: Config) -> StepWork:
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def age_seconds(iso: object) -> float | None:
+    try:
+        then = datetime.fromisoformat(str(iso))
+        return (datetime.now().astimezone() - then).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def is_fresh(iso: object, max_age: float) -> bool:
+    age = age_seconds(iso)
+    return age is not None and 0 <= age < max_age
 
 
 def docker(args: list[str], cwd: Path | None = None, timeout: float = 60) -> tuple[int, str, str]:
@@ -1304,6 +1333,7 @@ class StatusDB:
         self.path = path
         self.data = self._load(warn=True)
         self._changes: dict[str, dict] = {}
+        self._top: dict = {}
         self._known: set[str] | None = None
 
     def _load(self, warn: bool) -> dict:
@@ -1337,6 +1367,10 @@ class StatusDB:
             self.data["stacks"][name] = {}
         self.data["stacks"][name].update(values)
         self._changes.setdefault(name, {}).update(values)
+
+    def set_top(self, key: str, value: object) -> None:
+        self.data[key] = value
+        self._top[key] = value
 
     def set_health(self, name: str, snapshot: dict) -> None:
         self._set(name, {k: snapshot[k] for k in ("health", "summary", "problems", "checked_at", "containers")})
@@ -1381,6 +1415,7 @@ class StatusDB:
                 summary[entry["health"]] = summary.get(entry["health"], 0) + 1
         summary["updates_available"] = sum(e.get("updates_available") or 0 for e in stacks.values())
         data["summary"] = summary
+        data.update(self._top)
         data["tugboat_version"] = __version__
         data["written_at"] = now_iso()
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
@@ -1392,6 +1427,7 @@ class StatusDB:
             raise
         self.data = data
         self._changes = {}
+        self._top = {}
 
 
 HEALTH_STYLE = {
@@ -1471,19 +1507,28 @@ def show_overview(stacks: list[Path], db: StatusDB | None) -> dict[str, dict]:
     return snaps
 
 
-def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool) -> int:
+def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool,
+                    image_max_age: float = 0) -> int:
     say("\n" + dim(" · ").join([bold("HEALTH CHECK"),
                                 f"{len(selected)} stack{'s' if len(selected) > 1 else ''}",
                                 datetime.now().strftime("%Y-%m-%d %H:%M")]))
     rule("Stacks")
     snaps = check_all(selected)
-    images = check_images(selected, snaps) if image_check else None
+    images: dict[str, dict] | None = None
+    checked: dict[str, dict] = {}
+    if image_check:
+        images = {s.name: db.stack(s.name) for s in selected
+                  if db and is_fresh(db.stack(s.name).get("images_checked_at"), image_max_age)}
+        due = [s for s in selected if s.name not in images]
+        if due:
+            checked = check_images(due, snaps)
+            images.update(checked)
     print_health_table(selected, snaps, db, images)
     bad = [(s.name, snaps[s.name]) for s in selected if snaps[s.name]["problems"]]
     if db:
         for name, snap in snaps.items():
             db.set_health(name, snap)
-        for name, found in (images or {}).items():
+        for name, found in checked.items():
             db.set_images(name, found)
 
     if bad:
@@ -1494,6 +1539,10 @@ def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool
                 say(f"      {p}")
     if images is not None:
         print_image_report(selected, images)
+        ages = [age_seconds(images[s.name].get("images_checked_at")) or 0 for s in selected]
+        if not checked and ages:
+            say("\n" + dim(f"  Image versions from {fmt_time(max(ages))} ago - checked again when older than "
+                           f"{fmt_time(image_max_age)} (--check-images to check now)"))
     code = 1 if bad else 0
     if db:
         try:
@@ -1697,8 +1746,11 @@ def main() -> int:
     parser.add_argument("--only-outdated", action="store_true",
                         help="update only stacks that have a new image version (update only)")
     parser.add_argument("--skip-backup", action="store_true", help="skip the backup step (update only)")
-    parser.add_argument("--no-image-check", action="store_true",
-                        help="do not ask the registries for new image versions")
+    images_opt = parser.add_mutually_exclusive_group()
+    images_opt.add_argument("--no-image-check", action="store_true",
+                            help="do not ask the registries for new image versions")
+    images_opt.add_argument("--check-images", action="store_true",
+                            help="ask the registries now, even if image_check_interval has not passed")
     parser.add_argument("-v", "--verbose", action="store_true", help="show full command output live")
     parser.add_argument("--dry-run", action="store_true", help="show actions without running them")
     parser.add_argument("--version", action="version",
@@ -1723,7 +1775,8 @@ def main() -> int:
         user_warning = setup_docker_user(cfg.docker_user)
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
-        startup_update_check(cfg, args.dry_run)
+        db: StatusDB | None = None if args.dry_run else StatusDB(cfg.status_file)
+        startup_update_check(cfg, args.dry_run, db)
         stacks = find_stacks(cfg.container_path, cfg.ignore_folders)
     except (OSError, ValueError) as e:
         say_error(str(e))
@@ -1751,9 +1804,7 @@ def main() -> int:
         say_error("--only-outdated only works with --update.")
         return 2
 
-    db: StatusDB | None = None
-    if not args.dry_run:
-        db = StatusDB(cfg.status_file)
+    if db:
         db.forget_missing(stacks)
 
     snaps: dict[str, dict] | None = None
@@ -1778,9 +1829,10 @@ def main() -> int:
         say(dim("Nothing selected, exiting."))
         return 0
 
-    image_check = cfg.image_check and not args.no_image_check
+    image_check = (cfg.image_check or args.check_images) and not args.no_image_check
     if action == "healthcheck":
-        return run_healthcheck(selected, db, image_check)
+        max_age = 0 if args.check_images else cfg.image_check_interval * 60
+        return run_healthcheck(selected, db, image_check, max_age)
 
     lock = None
     if not args.dry_run:
