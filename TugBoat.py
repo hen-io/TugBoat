@@ -29,7 +29,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
