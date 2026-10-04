@@ -9,6 +9,7 @@ import grp
 import hashlib
 import json
 import os
+import platform
 import pwd
 import re
 import shutil
@@ -25,11 +26,11 @@ from http.client import HTTPException
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -1018,6 +1019,11 @@ REGISTRY_TIMEOUT = 10
 IMAGE_OUTDATED = ("update_available", "not_pulled")
 
 
+REGISTRY_MAX_BYTES = 8 * 1024 * 1024
+VERSION_LABEL = "org.opencontainers.image.version"
+SOURCE_LABELS = ("org.opencontainers.image.source", "org.opencontainers.image.url")
+
+
 class RegistryError(RuntimeError):
     pass
 
@@ -1101,9 +1107,20 @@ def registry_credentials(registry: str) -> tuple[str, str] | None:
     return None
 
 
+class _DropAuthOnNewHost(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urlsplit(newurl).netloc != urlsplit(req.full_url).netloc:
+            new.headers.pop("Authorization", None)
+        return new
+
+
+_OPENER = build_opener(_DropAuthOnNewHost)
+
+
 def _http_open(url: str, timeout: float, method: str = "GET", headers: dict | None = None):
     req = Request(url, method=method, headers={"User-Agent": f"{__title__}/{__version__}", **(headers or {})})
-    return urlopen(req, timeout=timeout)
+    return _OPENER.open(req, timeout=timeout)
 
 
 def _registry_auth(challenge: str, ref: ImageRef, timeout: float) -> str:
@@ -1138,6 +1155,7 @@ def _registry_auth(challenge: str, ref: ImageRef, timeout: float) -> str:
 
 
 _REGISTRY_TOKENS: dict[tuple[str, str], str] = {}
+_REGISTRY_BASE: dict[str, str] = {}
 
 
 def _manifest_digest(url: str, ref: ImageRef, timeout: float) -> str:
@@ -1173,7 +1191,9 @@ def remote_digest(ref: ImageRef, timeout: float = REGISTRY_TIMEOUT) -> str:
     problem = "no answer"
     for scheme in ("https", "http") if local else ("https",):
         try:
-            return _manifest_digest(f"{scheme}://{host}/v2/{ref.repo}/manifests/{ref.tag}", ref, timeout)
+            digest = _manifest_digest(f"{scheme}://{host}/v2/{ref.repo}/manifests/{ref.tag}", ref, timeout)
+            _REGISTRY_BASE[ref.registry] = f"{scheme}://{host}"
+            return digest
         except HTTPError as e:
             raise RegistryError({
                 401: "access denied - private image? (docker login)",
@@ -1186,25 +1206,123 @@ def remote_digest(ref: ImageRef, timeout: float = REGISTRY_TIMEOUT) -> str:
     raise RegistryError(problem)
 
 
-def local_image(image: str) -> tuple[str, set[str]] | None:
-    rc, out, err = docker(["image", "inspect", "--format", "{{.Id}}\t{{json .RepoDigests}}", image])
+def _registry_get(ref: ImageRef, path: str, accept: str, timeout: float = REGISTRY_TIMEOUT) -> bytes:
+    base = _REGISTRY_BASE.get(ref.registry)
+    if not base:
+        raise RegistryError("registry not reached yet")
+    key = (ref.registry, ref.repo)
+    headers = {"Accept": accept}
+    if key in _REGISTRY_TOKENS:
+        headers["Authorization"] = _REGISTRY_TOKENS[key]
+    for attempt in (0, 1):
+        try:
+            with _http_open(f"{base}/v2/{ref.repo}/{path}", timeout, "GET", headers) as r:
+                return r.read(REGISTRY_MAX_BYTES)
+        except HTTPError as e:
+            if e.code != 401 or attempt:
+                raise
+            headers["Authorization"] = _registry_auth(e.headers.get("WWW-Authenticate") or "", ref, timeout)
+            _REGISTRY_TOKENS[key] = headers["Authorization"]
+    raise RegistryError("registry did not answer")
+
+
+def host_platform() -> tuple[str, str]:
+    machine = platform.machine().lower()
+    return "linux", {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm", "armv6l": "arm"}.get(machine, machine)
+
+
+def remote_config(ref: ImageRef, digest: str, wanted: tuple[str, str]) -> tuple[dict, list]:
+    try:
+        manifest = json.loads(_registry_get(ref, f"manifests/{digest}", MANIFEST_TYPES))
+        if isinstance(manifest.get("manifests"), list):
+            entries = [m for m in manifest["manifests"] if isinstance(m, dict) and m.get("digest")]
+            match = [m for m in entries
+                     if ((m.get("platform") or {}).get("os"), (m.get("platform") or {}).get("architecture")) == wanted]
+            if not match:
+                return {}, []
+            manifest = json.loads(_registry_get(ref, f"manifests/{match[0]['digest']}", MANIFEST_TYPES))
+        config = json.loads(_registry_get(ref, f"blobs/{manifest['config']['digest']}", "application/json"))
+        labels = (config.get("config") or {}).get("Labels") or {}
+        env = (config.get("config") or {}).get("Env") or []
+        return labels if isinstance(labels, dict) else {}, env if isinstance(env, list) else []
+    except (URLError, OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError, RegistryError):
+        return {}, []
+
+
+def image_version(labels: dict, env: list, ref: ImageRef) -> str:
+    version = str(labels.get(VERSION_LABEL) or "").strip()
+    if not version:
+        name = re.sub(r"[^A-Z0-9]", "_", ref.repo.rsplit("/", 1)[-1].upper()) + "_VERSION="
+        version = next((str(e)[len(name):].strip() for e in env if str(e).startswith(name)), "")
+    return version or (ref.tag if re.search(r"\d", ref.tag) else "")
+
+
+def image_page(ref: ImageRef) -> str:
+    if ref.registry == DOCKER_HUB:
+        name = ref.repo.split("/", 1)[1] if ref.repo.startswith("library/") else ""
+        return f"https://hub.docker.com/_/{name}" if name else f"https://hub.docker.com/r/{ref.repo}"
+    return f"https://{ref.registry}/{ref.repo}"
+
+
+def image_details(info: dict, ref: ImageRef, local: LocalImage | None, prior: dict) -> None:
+    labels = local.labels if local else {}
+    registry_image = info["status"] not in ("local", "unknown")
+    source = next((str(labels[k]).strip() for k in SOURCE_LABELS if labels.get(k)), "")
+    if local:
+        info["local_version"] = image_version(labels, local.env, ref)
+    if info["status"] == "up_to_date":
+        info["remote_version"] = info["local_version"]
+    elif info["status"] in IMAGE_OUTDATED and info["remote_digest"]:
+        if prior.get("remote_digest") == info["remote_digest"] and "remote_version" in prior:
+            info["remote_version"] = str(prior["remote_version"])
+            source = source or str(prior.get("source_url") or "")
+        else:
+            found, env = remote_config(ref, info["remote_digest"], local.platform if local else host_platform())
+            info["remote_version"] = image_version(found, env, ref)
+            source = source or next((str(found[k]).strip() for k in SOURCE_LABELS if found.get(k)), "")
+    info["source_url"] = source or (image_page(ref) if registry_image else "")
+
+
+@dataclass
+class LocalImage:
+    id: str
+    digests: set[str]
+    labels: dict
+    env: list
+    platform: tuple[str, str]
+
+
+def local_image(image: str) -> LocalImage | None:
+    rc, out, err = docker(["image", "inspect", "--format",
+                           "{{.Id}}\t{{json .RepoDigests}}\t{{json .Config.Labels}}\t{{.Os}}\t{{.Architecture}}"
+                           "\t{{json .Config.Env}}",
+                           image])
     if rc != 0:
         if "no such" in err.lower():
             return None
         raise RegistryError(_last_line(err, f"docker image inspect exit code {rc}"))
-    image_id, _, digests = out.strip().partition("\t")
+    parts = (out.strip().split("\t", 5) + [""] * 6)[:6]
     try:
-        repo_digests = json.loads(digests) or []
+        repo_digests = json.loads(parts[1]) or []
     except ValueError:
         repo_digests = []
-    return image_id, {d.rpartition("@")[2] for d in repo_digests if "@" in d}
+    try:
+        labels = json.loads(parts[2]) or {}
+        env = json.loads(parts[5]) or []
+    except ValueError:
+        labels, env = {}, []
+    return LocalImage(parts[0], {d.rpartition("@")[2] for d in repo_digests if "@" in d},
+                      labels if isinstance(labels, dict) else {}, env if isinstance(env, list) else [],
+                      (parts[3], parts[4]))
 
 
-def inspect_image(image: str, built: bool) -> dict:
-    info = {"status": "unknown", "local_digest": "", "remote_digest": "", "detail": "", "id": ""}
+def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
+    info = {"status": "unknown", "local_digest": "", "remote_digest": "", "detail": "", "id": "",
+            "local_version": "", "remote_version": "", "source_url": ""}
+    ref = parse_image_ref(image)
+    local: LocalImage | None = None
     try:
         local = local_image(image)
-        ref = parse_image_ref(image)
         if built:
             info.update(status="local", detail="built from a Dockerfile")
         elif ref is None:
@@ -1215,17 +1333,19 @@ def inspect_image(image: str, built: bool) -> dict:
             info.update(remote_digest=remote_digest(ref), status="not_pulled", detail="not pulled yet")
         elif ref.digest:
             info.update(status="pinned", local_digest=ref.digest, detail="pinned to a digest")
-        elif not local[1]:
+        elif not local.digests:
             info.update(status="local", detail="not from a registry (built or loaded locally)")
         else:
             remote = remote_digest(ref)
             info["remote_digest"] = remote
-            info["local_digest"] = remote if remote in local[1] else sorted(local[1])[0]
-            info["status"] = "up_to_date" if remote in local[1] else "update_available"
+            info["local_digest"] = remote if remote in local.digests else sorted(local.digests)[0]
+            info["status"] = "up_to_date" if remote in local.digests else "update_available"
         if local:
-            info["id"] = local[0]
+            info["id"] = local.id
     except RegistryError as e:
         info["detail"] = str(e)
+    if ref is not None:
+        image_details(info, ref, local, prior or {})
     return info
 
 
@@ -1267,8 +1387,10 @@ def running_image_ids(containers: list[dict]) -> dict[str, set[str]]:
     return ids
 
 
-def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False) -> dict[str, dict]:
+def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False,
+                 db: "StatusDB | None" = None) -> dict[str, dict]:
     busy = IS_TTY and not quiet
+    prior = db.known_images() if db else {}
     if busy:
         write(f"  {cyan(SPINNER[0])} {dim('Checking registries for new images...')}")
 
@@ -1282,7 +1404,8 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
         for declared, _ in gathered.values():
             for image, entry in declared.items():
                 wanted[image] = wanted.get(image, False) or entry["built"]
-        checked = dict(zip(wanted, pool.map(lambda image: inspect_image(image, wanted[image]), wanted)))
+        checked = dict(zip(wanted, pool.map(
+            lambda image: inspect_image(image, wanted[image], prior.get(image)), wanted)))
     if busy:
         write("\r\033[K")
 
@@ -1294,8 +1417,8 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
             image_id = info.pop("id")
             if info["status"] == "up_to_date" and in_use.get(image) and image_id not in in_use[image]:
                 info.update(status="update_available", detail="new image is pulled, containers still run the old one")
-            images.append({k: info[k] for k in ("image", "services", "status", "local_digest",
-                                                "remote_digest", "detail")})
+            images.append({k: info[k] for k in ("image", "services", "status", "local_version", "remote_version",
+                                                "local_digest", "remote_digest", "source_url", "detail")})
         result[name] = {
             "images": images,
             "updates_available": sum(i["status"] in IMAGE_OUTDATED for i in images),
@@ -1317,7 +1440,10 @@ def print_image_report(stacks: list[Path], images: dict[str, dict]) -> None:
     if outdated:
         rule(f"Image updates ({len(outdated)})")
         for name, i in outdated:
-            note = i["detail"] or f"{i['local_digest'][7:19]} {SYM['arrow']} {i['remote_digest'][7:19]}"
+            old, new = i.get("local_version"), i.get("remote_version")
+            if not (old and new and old != new):
+                old, new = i["local_digest"][7:19], i["remote_digest"][7:19]
+            note = i["detail"] or f"{old} {SYM['arrow']} {new}"
             say(f"  {yellow(SYM['up'])} {name:<{width}}  {i['image']:<{iwidth}}  {dim(note)}")
     if unknown:
         rule(f"Images not checked ({len(unknown)})")
@@ -1367,6 +1493,15 @@ class StatusDB:
             self.data["stacks"][name] = {}
         self.data["stacks"][name].update(values)
         self._changes.setdefault(name, {}).update(values)
+
+    def known_images(self) -> dict[str, dict]:
+        known: dict[str, dict] = {}
+        for entry in self.data["stacks"].values():
+            images = entry.get("images") if isinstance(entry, dict) else None
+            for image in images if isinstance(images, list) else []:
+                if isinstance(image, dict) and image.get("image"):
+                    known[str(image["image"])] = image
+        return known
 
     def set_top(self, key: str, value: object) -> None:
         self.data[key] = value
@@ -1521,7 +1656,7 @@ def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool
                   if db and is_fresh(db.stack(s.name).get("images_checked_at"), image_max_age)}
         due = [s for s in selected if s.name not in images]
         if due:
-            checked = check_images(due, snaps)
+            checked = check_images(due, snaps, db=db)
             images.update(checked)
     print_health_table(selected, snaps, db, images)
     bad = [(s.name, snaps[s.name]) for s in selected if snaps[s.name]["problems"]]
@@ -1860,7 +1995,7 @@ def main() -> int:
     say("\n" + dim(" · ").join(plan))
 
     if action == "update" and args.only_outdated:
-        found = check_images(selected, check_all(selected))
+        found = check_images(selected, check_all(selected), db=db)
         if db:
             for name, images in found.items():
                 db.set_images(name, images)
@@ -1914,7 +2049,7 @@ def main() -> int:
                 db.set_health(stack.name, snap)
                 db.set_action(res, action)
                 if action == "update" and res.ok and (image_check or args.only_outdated) and not interrupted:
-                    db.set_images(stack.name, check_images([stack], {stack.name: snap}, quiet=True)[stack.name])
+                    db.set_images(stack.name, check_images([stack], {stack.name: snap}, quiet=True, db=db)[stack.name])
                 db.save()
             except OSError as e:
                 res.warnings.append(Issue(stack.name, "Status file", e.strerror or str(e)))
