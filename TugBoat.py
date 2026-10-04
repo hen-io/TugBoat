@@ -30,7 +30,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -1277,7 +1277,7 @@ def image_details(info: dict, ref: ImageRef, local: LocalImage | None, prior: di
             info["remote_version"] = str(prior["remote_version"])
             source = source or str(prior.get("source_url") or "")
         else:
-            found, env = remote_config(ref, info["remote_digest"], local.platform if local else host_platform())
+            found, env = remote_config(ref, info["remote_digest"], local.platform if local and all(local.platform) else host_platform())
             info["remote_version"] = image_version(found, env, ref)
             source = source or next((str(found[k]).strip() for k in SOURCE_LABELS if found.get(k)), "")
     info["source_url"] = source or (image_page(ref) if registry_image else "")
@@ -1293,27 +1293,24 @@ class LocalImage:
 
 
 def local_image(image: str) -> LocalImage | None:
-    rc, out, err = docker(["image", "inspect", "--format",
-                           "{{.Id}}\t{{json .RepoDigests}}\t{{json .Config.Labels}}\t{{.Os}}\t{{.Architecture}}"
-                           "\t{{json .Config.Env}}",
-                           image])
+    rc, out, err = docker(["image", "inspect", image])
     if rc != 0:
         if "no such" in err.lower():
             return None
         raise RegistryError(_last_line(err, f"docker image inspect exit code {rc}"))
-    parts = (out.strip().split("\t", 5) + [""] * 6)[:6]
     try:
-        repo_digests = json.loads(parts[1]) or []
-    except ValueError:
-        repo_digests = []
-    try:
-        labels = json.loads(parts[2]) or {}
-        env = json.loads(parts[5]) or []
-    except ValueError:
-        labels, env = {}, []
-    return LocalImage(parts[0], {d.rpartition("@")[2] for d in repo_digests if "@" in d},
-                      labels if isinstance(labels, dict) else {}, env if isinstance(env, list) else [],
-                      (parts[3], parts[4]))
+        data = json.loads(out)
+        data = data[0] if isinstance(data, list) else data
+    except (ValueError, IndexError):
+        data = None
+    if not isinstance(data, dict):
+        raise RegistryError("could not read docker image inspect output")
+    config = data.get("Config") if isinstance(data.get("Config"), dict) else {}
+    repo_digests = data.get("RepoDigests") if isinstance(data.get("RepoDigests"), list) else []
+    labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+    env = config.get("Env") if isinstance(config.get("Env"), list) else []
+    return LocalImage(str(data.get("Id") or ""), {str(d).rpartition("@")[2] for d in repo_digests if "@" in str(d)},
+                      labels, env, (str(data.get("Os") or ""), str(data.get("Architecture") or "")))
 
 
 def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
