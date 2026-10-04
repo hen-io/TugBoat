@@ -30,7 +30,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -1455,6 +1455,7 @@ class StatusDB:
     def __init__(self, path: Path):
         self.path = path
         self.data = self._load(warn=True)
+        self.written_by = self.data.get("tugboat_version")
         self._changes: dict[str, dict] = {}
         self._top: dict = {}
         self._known: set[str] | None = None
@@ -1649,8 +1650,9 @@ def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool
     images: dict[str, dict] | None = None
     checked: dict[str, dict] = {}
     if image_check:
+        same_version = bool(db) and db.written_by == __version__
         images = {s.name: db.stack(s.name) for s in selected
-                  if db and is_fresh(db.stack(s.name).get("images_checked_at"), image_max_age)}
+                  if same_version and is_fresh(db.stack(s.name).get("images_checked_at"), image_max_age)}
         due = [s for s in selected if s.name not in images]
         if due:
             checked = check_images(due, snaps, db=db)
