@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.client import HTTPException
@@ -31,12 +31,12 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
 CONFIG_DEFAULTS = {
-    "stacks_directory": ".",
+    "stacks_directory": "., ./Stacks",
     "require_root": "true",
     "status_file": "./TugBoat/tugboat.json",
     "ignore_folders": "",
@@ -56,6 +56,7 @@ CONFIG_DEFAULTS = {
     "healthcheck_interval": "1",
     "install_dependencies": "true",
     "command_timeout": "0",
+    "parallel_stacks": "4",
     "update_check": "true",
     "update_check_interval": "60",
     "auto_update": "true",
@@ -81,6 +82,7 @@ CONFIG_HELP = {
     "healthcheck_interval": "Minutes between health checks (1-59, or whole hours: 60, 120 ...)",
     "install_dependencies": "Install missing Docker, Compose plugin and cron (apt, dnf, pacman)",
     "command_timeout": "Seconds before a stop, start or update command is stopped (0 = no limit)",
+    "parallel_stacks": "Stacks handled at the same time by update, start, stop and restart (1 = one by one)",
     "update_check": "Look for a new TugBoat release",
     "update_check_interval": "Minutes between checks for a new TugBoat release",
     "auto_update": "Install new TugBoat releases automatically",
@@ -88,7 +90,7 @@ CONFIG_HELP = {
 CONFIG_GROUPS = (
     ("stacks_directory", "require_root", "status_file", "ignore_folders"),
     ("backup", "backup_path", "backup_retention", "backup_large_mb", "backup_large_retention"),
-    ("docker_user", "health_wait", "command_timeout"),
+    ("docker_user", "health_wait", "command_timeout", "parallel_stacks"),
     ("image_check", "image_check_interval", "registry_timeout"),
     ("icons", "icon_index_days"),
     ("manage_cron", "healthcheck_interval", "install_dependencies"),
@@ -309,9 +311,34 @@ CANCEL = threading.Event()
 ACTIVE_PROCS: set[subprocess.Popen] = set()
 
 
+class StepControl:
+
+    def __init__(self):
+        self.cancel = threading.Event()
+        self.procs: set[subprocess.Popen] = set()
+
+
+_STEP = threading.local()
+
+
+def cancelled() -> bool:
+    ctl = getattr(_STEP, "ctl", None)
+    return CANCEL.is_set() or (ctl is not None and ctl.cancel.is_set())
+
+
+def wait_cancelled(seconds: float) -> bool:
+    end = time.monotonic() + seconds
+    while not cancelled() and time.monotonic() < end:
+        time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+    return cancelled()
+
+
 def stop_active(grace: float = 10) -> None:
     CANCEL.set()
-    procs = list(ACTIVE_PROCS)
+    kill_procs(list(ACTIVE_PROCS), grace)
+
+
+def kill_procs(procs: list[subprocess.Popen], grace: float = 10) -> None:
     for proc in procs:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
@@ -329,14 +356,21 @@ def stop_active(grace: float = 10) -> None:
 
 
 class Runner:
-    def __init__(self, verbose: bool, dry_run: bool):
+    def __init__(self, verbose: bool, dry_run: bool, buffer: list[str] | None = None):
         self.verbose = verbose
         self.dry_run = dry_run
+        self.buffer = buffer
+
+    def out(self, text: str) -> None:
+        if self.buffer is None:
+            say(text)
+        else:
+            self.buffer.append(text)
 
     def _line(self, status: str, label: str, seconds: float | None, note: str) -> None:
         sym = STATUS_STYLE[status](SYM[status])
         t = dim(f"{fmt_time(seconds):>7}") if seconds is not None else " " * 7
-        say(f"  {sym} {label:<20} {t}  {note}".rstrip())
+        self.out(f"  {sym} {label:<20} {t}  {note}".rstrip())
 
     def skip(self, label: str, note: str) -> None:
         self._line("skip", label, None, dim(note))
@@ -349,14 +383,16 @@ class Runner:
         output: list[str] = []
         result: dict = {}
         timed_out = False
-        CANCEL.clear()
+        ctl = StepControl()
+        live = IS_TTY and not self.verbose and self.buffer is None
 
         def emit(line: str) -> None:
             output.append(line)
             if self.verbose:
-                say(dim(f"      {SYM['bar']} {line}"))
+                self.out(dim(f"      {SYM['bar']} {line}"))
 
         def worker() -> None:
+            _STEP.ctl = ctl
             try:
                 result["r"] = work(emit)
             except Exception as e:
@@ -364,7 +400,7 @@ class Runner:
 
         start = time.monotonic()
         if self.verbose:
-            say(f"  {cyan(SYM['arrow'])} {label}")
+            self.out(f"  {cyan(SYM['arrow'])} {label}")
         t = threading.Thread(target=worker, daemon=True)
         t.start()
         frame = 0
@@ -372,8 +408,9 @@ class Runner:
             while t.is_alive():
                 if timeout and not timed_out and time.monotonic() - start > timeout:
                     timed_out = True
-                    stop_active()
-                if IS_TTY and not self.verbose:
+                    ctl.cancel.set()
+                    kill_procs(list(ctl.procs))
+                if live:
                     elapsed = fmt_time(time.monotonic() - start)
                     last = output[-1].strip() if output else ""
                     room = max(0, term_width() - 36)
@@ -386,7 +423,7 @@ class Runner:
             t.join(30)
             raise
         finally:
-            if IS_TTY and not self.verbose:
+            if live:
                 write("\r\033[K")
 
         ok, note, details = result.get("r", (False, "no result", []))
@@ -411,14 +448,18 @@ def command_work(cmd: str, cwd: Path) -> StepWork:
                                 text=True, errors="replace", bufsize=1,
                                 start_new_session=True, **DOCKER_RUN_AS)
         assert proc.stdout is not None
+        ctl = getattr(_STEP, "ctl", None)
+        own = ctl.procs if ctl else set()
         ACTIVE_PROCS.add(proc)
+        own.add(proc)
         try:
             for line in proc.stdout:
                 emit(line.rstrip("\n").split("\r")[-1])
             rc = proc.wait()
         finally:
             ACTIVE_PROCS.discard(proc)
-        if CANCEL.is_set():
+            own.discard(proc)
+        if cancelled():
             return False, "cancelled", []
         return rc == 0, "" if rc == 0 else f"exit code {rc}", []
     return work
@@ -673,6 +714,7 @@ class Config:
     install_dependencies: bool
     icons: bool
     icon_index_days: int
+    parallel_stacks: int
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -932,6 +974,7 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         install_dependencies=_parse_bool(get("install_dependencies"), "install_dependencies"),
         icons=_parse_bool(get("icons"), "icons"),
         icon_index_days=max(1, _parse_int(get("icon_index_days"), "icon_index_days")),
+        parallel_stacks=max(1, _parse_int(get("parallel_stacks"), "parallel_stacks")),
     )
 
 
@@ -1521,7 +1564,7 @@ def _is_special(path: str) -> bool:
 
 
 def _copy_file(src: str, dst: str, *, follow_symlinks: bool = True) -> str:
-    if CANCEL.is_set():
+    if cancelled():
         raise InterruptedError("cancelled")
     shutil.copyfile(src, dst, follow_symlinks=follow_symlinks)
     st = os.lstat(src)
@@ -1573,7 +1616,7 @@ def backup_work(stack: Path, dest: Path) -> StepWork:
                        for src, _, reason in failures[:10]]
             if len(failures) > 10:
                 details.append(f"... and {len(failures) - 10} more")
-            note = "cancelled" if CANCEL.is_set() else f"{len(failures)} file(s) could not be copied"
+            note = "cancelled" if cancelled() else f"{len(failures)} file(s) could not be copied"
         except OSError as e:
             details, note = [], str(e)
         shutil.rmtree(dest, ignore_errors=True)
@@ -1753,7 +1796,7 @@ def health_work(stack: Path, cfg: Config, res: StackResult) -> StepWork:
                 last = snap["summary"]
             if snap["health"] != "starting" or time.monotonic() >= deadline:
                 break
-            if CANCEL.wait(3):
+            if wait_cancelled(3):
                 break
         res.health = snap
         h = snap["health"]
@@ -2001,7 +2044,25 @@ def host_platform() -> tuple[str, str]:
     return "linux", {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "arm", "armv6l": "arm"}.get(machine, machine)
 
 
-def remote_config(ref: ImageRef, digest: str, wanted: tuple[str, str]) -> tuple[dict, list]:
+CREATED_LABEL = "org.opencontainers.image.created"
+
+
+def release_date(labels: dict, created: object) -> str:
+    for value in (labels.get(CREATED_LABEL), created):
+        text = str(value or "").strip()
+        match = re.match(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})?$", text)
+        if not match or int(text[:4]) < 2000:
+            continue
+        zone = match.group(3) or "Z"
+        try:
+            when = datetime.fromisoformat(f"{match.group(1)}T{match.group(2)}{'+00:00' if zone == 'Z' else zone}")
+        except ValueError:
+            continue
+        return when.isoformat(timespec="seconds")
+    return ""
+
+
+def remote_config(ref: ImageRef, digest: str, wanted: tuple[str, str]) -> tuple[dict, list, str]:
     try:
         manifest = json.loads(_registry_get(ref, f"manifests/{digest}", MANIFEST_TYPES))
         if isinstance(manifest.get("manifests"), list):
@@ -2009,14 +2070,15 @@ def remote_config(ref: ImageRef, digest: str, wanted: tuple[str, str]) -> tuple[
             match = [m for m in entries
                      if ((m.get("platform") or {}).get("os"), (m.get("platform") or {}).get("architecture")) == wanted]
             if not match:
-                return {}, []
+                return {}, [], ""
             manifest = json.loads(_registry_get(ref, f"manifests/{match[0]['digest']}", MANIFEST_TYPES))
         config = json.loads(_registry_get(ref, f"blobs/{manifest['config']['digest']}", "application/json"))
         labels = (config.get("config") or {}).get("Labels") or {}
         env = (config.get("config") or {}).get("Env") or []
-        return labels if isinstance(labels, dict) else {}, env if isinstance(env, list) else []
+        labels = labels if isinstance(labels, dict) else {}
+        return labels, env if isinstance(env, list) else [], release_date(labels, config.get("created"))
     except (URLError, OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError, RegistryError):
-        return {}, []
+        return {}, [], ""
 
 
 def image_version(labels: dict, env: list, ref: ImageRef) -> str:
@@ -2040,15 +2102,21 @@ def image_details(info: dict, ref: ImageRef, local: LocalImage | None, prior: di
     source = next((str(labels[k]).strip() for k in SOURCE_LABELS if labels.get(k)), "")
     if local:
         info["local_version"] = image_version(labels, local.env, ref)
+        info["local_release_date"] = local.created
     if info["status"] == "up_to_date":
         info["remote_version"] = info["local_version"]
+        info["remote_release_date"] = info["local_release_date"]
     elif info["status"] in IMAGE_OUTDATED and info["remote_digest"]:
-        if prior.get("remote_digest") == info["remote_digest"] and "remote_version" in prior:
+        if (prior.get("remote_digest") == info["remote_digest"] and "remote_version" in prior
+                and "remote_release_date" in prior):
             info["remote_version"] = str(prior["remote_version"])
+            info["remote_release_date"] = str(prior["remote_release_date"])
             source = source or str(prior.get("source_url") or "")
         else:
-            found, env = remote_config(ref, info["remote_digest"], local.platform if local and all(local.platform) else host_platform())
+            found, env, created = remote_config(
+                ref, info["remote_digest"], local.platform if local and all(local.platform) else host_platform())
             info["remote_version"] = image_version(found, env, ref)
+            info["remote_release_date"] = created
             source = source or next((str(found[k]).strip() for k in SOURCE_LABELS if found.get(k)), "")
     info["source_url"] = source or (image_page(ref) if registry_image else "")
 
@@ -2060,6 +2128,7 @@ class LocalImage:
     labels: dict
     env: list
     platform: tuple[str, str]
+    created: str = ""
 
 
 def local_image(image: str) -> LocalImage | None:
@@ -2080,12 +2149,14 @@ def local_image(image: str) -> LocalImage | None:
     labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
     env = config.get("Env") if isinstance(config.get("Env"), list) else []
     return LocalImage(str(data.get("Id") or ""), {str(d).rpartition("@")[2] for d in repo_digests if "@" in str(d)},
-                      labels, env, (str(data.get("Os") or ""), str(data.get("Architecture") or "")))
+                      labels, env, (str(data.get("Os") or ""), str(data.get("Architecture") or "")),
+                      release_date(labels, data.get("Created")))
 
 
 def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
     info = {"status": "unknown", "local_digest": "", "remote_digest": "", "detail": "", "id": "",
-            "local_version": "", "remote_version": "", "source_url": "", "label_icon": ""}
+            "local_version": "", "remote_version": "", "local_release_date": "", "remote_release_date": "",
+            "source_url": "", "label_icon": ""}
     ref = parse_image_ref(image)
     local: LocalImage | None = None
     try:
@@ -2339,6 +2410,7 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
                 info.update(ICONS.lookup(entry["icon"] or info["label_icon"], image_icon_names(image, entry),
                                          prior.get(image) or {}))
             images.append({k: info[k] for k in ("image", "services", "status", "local_version", "remote_version",
+                                                "local_release_date", "remote_release_date",
                                                 "local_digest", "remote_digest", "source_url", "icon", "icon_url",
                                                 "detail")})
         stack_icon = dict(NO_ICON)
@@ -2683,7 +2755,7 @@ def clear_work(remove: list[dict], blocked: list[str]) -> StepWork:
         if blocked:
             return False, "container name used by another stack", blocked
         for c in remove:
-            if CANCEL.is_set():
+            if cancelled():
                 return False, "cancelled", []
             if c["running"]:
                 emit(f"stopping {c['name']}")
@@ -2882,7 +2954,7 @@ def restore_work(stack: Path, backup: Path) -> StepWork:
         try:
             emit(f"clearing {stack}")
             for entry in stack.iterdir():
-                if CANCEL.is_set():
+                if cancelled():
                     return False, "cancelled", []
                 if entry.is_symlink() or not entry.is_dir():
                     entry.unlink()
@@ -2898,7 +2970,7 @@ def restore_work(stack: Path, backup: Path) -> StepWork:
                        for src, _, reason in failures[:10]]
             if len(failures) > 10:
                 details.append(f"... and {len(failures) - 10} more")
-            note = "cancelled" if CANCEL.is_set() else f"{len(failures)} file(s) could not be restored"
+            note = "cancelled" if cancelled() else f"{len(failures)} file(s) could not be restored"
             return False, note, details
         except OSError as e:
             return False, str(e), []
@@ -3138,6 +3210,8 @@ def main() -> int:
                         help="no questions: default action update, all stacks unless named, confirm everything")
     parser.add_argument("--only-outdated", action="store_true",
                         help="update only stacks that have a new image version (update only)")
+    parser.add_argument("-j", "--parallel", type=int, metavar="N",
+                        help="stacks to handle at the same time (default: parallel_stacks in the config)")
     parser.add_argument("--skip-backup", action="store_true",
                         help="skip the backup step (update and rollback)")
     parser.add_argument("--to", metavar="BACKUP",
@@ -3361,6 +3435,8 @@ def main() -> int:
         plan.append(f"backup {'on' if do_backup else yellow('off')}")
         if args.only_outdated:
             plan.append("only outdated")
+    if action != "rollback" and len(selected) > 1:
+        plan.append(f"{min(max(1, args.parallel or cfg.parallel_stacks), len(selected))} at a time")
     if action == "rollback":
         plan.append(f"to {rollback_to.name}")
         plan.append(f"safety backup {'off' if args.skip_backup else 'on'}")
@@ -3402,48 +3478,122 @@ def main() -> int:
             say("\n" + green(f"{SYM['ok']} Nothing to update.") + "\n")
             return 0
 
-    results: list[StackResult] = []
+    def run_one(stack: Path, runner: Runner) -> StackResult:
+        begun = time.monotonic()
+        if action == "stop":
+            res = stop_stack(stack, cfg, runner)
+        elif action == "start":
+            res = start_stack(stack, cfg, runner)
+        elif action == "restart":
+            res = restart_stack(stack, cfg, runner)
+        elif action == "rollback":
+            res = rollback_stack(stack, cfg, rollback_to, not args.skip_backup, runner)
+        elif action == "update":
+            res = update_stack(stack, cfg, do_backup, runner)
+        else:
+            raise ValueError(f"unknown action '{action}'")
+        res.seconds = time.monotonic() - begun
+        return res
+
+    def record(stack: Path, res: StackResult) -> bool:
+        if not db:
+            return False
+        try:
+            snap = res.health or check_health(stack)
+            db.set_health(stack.name, snap)
+            db.set_action(res, action)
+            if action == "update" and res.ok and (image_check or args.only_outdated) and not CANCEL.is_set():
+                db.set_images(stack.name, check_images([stack], {stack.name: snap}, quiet=True, db=db)[stack.name])
+            db.save()
+        except OSError as e:
+            res.warnings.append(Issue(stack.name, "Status file", e.strerror or str(e)))
+        except KeyboardInterrupt:
+            return True
+        return False
+
+    def interrupted_result(stack: Path) -> StackResult:
+        res = StackResult(stack.name, ok=False, status="interrupted")
+        res.errors.append(Issue(stack.name, "-", "interrupted (Ctrl+C or terminated)"))
+        return res
+
+    finished: dict[str, StackResult] = {}
     interrupted = False
     run_start = time.monotonic()
     total = len(selected)
-    for i, stack in enumerate(selected, 1):
-        rule(f"[{i}/{total}] {stack.name}")
-        start = time.monotonic()
-        try:
-            if action == "stop":
-                res = stop_stack(stack, cfg, ui)
-            elif action == "start":
-                res = start_stack(stack, cfg, ui)
-            elif action == "restart":
-                res = restart_stack(stack, cfg, ui)
-            elif action == "rollback":
-                res = rollback_stack(stack, cfg, rollback_to, not args.skip_backup, ui)
-            elif action == "update":
-                res = update_stack(stack, cfg, do_backup, ui)
-            else:
-                raise ValueError(f"unknown action '{action}'")
-        except KeyboardInterrupt:
-            res = StackResult(stack.name, ok=False, status="interrupted")
-            res.errors.append(Issue(stack.name, "-", "interrupted (Ctrl+C or terminated)"))
-            interrupted = True
-        res.seconds = time.monotonic() - start
-        results.append(res)
-        if db:
+    workers = min(max(1, args.parallel or cfg.parallel_stacks), total)
+    if workers == 1:
+        for i, stack in enumerate(selected, 1):
+            rule(f"[{i}/{total}] {stack.name}")
+            begun = time.monotonic()
             try:
-                snap = res.health or check_health(stack)
-                db.set_health(stack.name, snap)
-                db.set_action(res, action)
-                if action == "update" and res.ok and (image_check or args.only_outdated) and not interrupted:
-                    db.set_images(stack.name, check_images([stack], {stack.name: snap}, quiet=True, db=db)[stack.name])
-                db.save()
-            except OSError as e:
-                res.warnings.append(Issue(stack.name, "Status file", e.strerror or str(e)))
+                res = run_one(stack, ui)
             except KeyboardInterrupt:
+                res = interrupted_result(stack)
+                res.seconds = time.monotonic() - begun
                 interrupted = True
-        if interrupted:
-            break
+            finished[stack.name] = res
+            interrupted = record(stack, res) or interrupted
+            if interrupted:
+                break
+    else:
+        say(dim(f"  {workers} stacks at a time"))
+        running: dict[str, float] = {}
 
-    pending = [s.name for s in selected[len(results):]]
+        def job(stack: Path) -> tuple[Path, StackResult, list[str]]:
+            lines: list[str] = []
+            running[stack.name] = time.monotonic()
+            try:
+                res = run_one(stack, Runner(args.verbose, args.dry_run, lines))
+            except Exception as e:
+                res = StackResult(stack.name, ok=False, status="crashed")
+                res.errors.append(Issue(stack.name, "-", f"{type(e).__name__}: {e}"))
+                res.seconds = time.monotonic() - running[stack.name]
+            finally:
+                running.pop(stack.name, None)
+            return stack, res, lines
+
+        def show(stack: Path, res: StackResult, lines: list[str]) -> None:
+            if IS_TTY:
+                write("\r\033[K")
+            if CANCEL.is_set() and not res.ok:
+                res.status = "interrupted"
+            rule(f"[{len(finished) + 1}/{total}] {stack.name}")
+            for line in lines:
+                say(line)
+            finished[stack.name] = res
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        waiting = {pool.submit(job, stack) for stack in selected}
+        frame = 0
+        try:
+            while waiting:
+                done, waiting = wait(waiting, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda f: selected.index(f.result()[0])):
+                    show(*future.result())
+                    interrupted = record(*future.result()[:2]) or interrupted
+                if interrupted:
+                    raise KeyboardInterrupt
+                if IS_TTY and waiting and running:
+                    names = ", ".join(sorted(running))
+                    text = f"{len(finished)}/{total} done {SYM['bar']} running: {names}"
+                    write(f"\r\033[K  {cyan(SPINNER[frame % len(SPINNER)])} {dim(text[:max(10, term_width() - 6)])}")
+                    frame += 1
+        except KeyboardInterrupt:
+            interrupted = True
+            for future in waiting:
+                future.cancel()
+            stop_active()
+            for future in waiting:
+                if not future.cancelled():
+                    show(*future.result())
+                    record(*future.result()[:2])
+        finally:
+            if IS_TTY:
+                write("\r\033[K")
+            pool.shutdown(wait=True)
+
+    results = [finished[s.name] for s in selected if s.name in finished]
+    pending = [s.name for s in selected if s.name not in finished]
     print_report(results, pending, action, time.monotonic() - run_start, interrupted)
     if db:
         say(dim(f"Status written to {db.path}") + "\n")

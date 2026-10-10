@@ -130,6 +130,7 @@ else
     if [ -n "$DOCKER_USER" ]; then
         say "Docker commands will run as $DOCKER_USER (docker_user in TugBoat.conf)"
     fi
+    mkdir -p "$DIR/Stacks"
     say "Created $CONF"
 fi
 
