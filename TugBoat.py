@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -409,6 +409,18 @@ def install_release(rel: dict, dry_run: bool) -> bool:
             os.chown(tmp, st.st_uid, st.st_gid)
         except PermissionError:
             pass
+        try:
+            check = subprocess.run([sys.executable, str(tmp), "--version"], capture_output=True, text=True,
+                                   stdin=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            check = None
+            problem = str(e)
+        else:
+            problem = _last_line(check.stderr, f"exit code {check.returncode}")
+        if check is None or check.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            say_error(f"The downloaded file does not run ({problem}) - keeping the current version")
+            return False
         os.replace(tmp, script)
     except OSError as e:
         tmp.unlink(missing_ok=True)

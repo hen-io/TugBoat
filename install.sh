@@ -78,6 +78,7 @@ say "Downloading TugBoat from $RAW"
 fetch "$RAW/TugBoat.py" "$TMP/TugBoat.py" || fail "could not download TugBoat.py"
 python3 -c 'import sys; compile(open(sys.argv[1], encoding="utf-8-sig").read(), "TugBoat.py", "exec")' "$TMP/TugBoat.py" \
     || fail "the downloaded TugBoat.py is not a valid script"
+python3 "$TMP/TugBoat.py" --version >/dev/null 2>&1 || fail "the downloaded TugBoat.py does not run - nothing was installed"
 
 mkdir -p "$DIR"
 SCRIPT="$DIR/TugBoat.py"
