@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.3.3"
+__version__ = "0.4.0"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -694,15 +694,40 @@ def cron_command() -> str:
             "--healthcheck >/dev/null 2>&1")
 
 
+CRON_ENV_RE = re.compile(r"^[A-Za-z_]\w*=[\w.,:/@%+=-]*$")
+CRON_WORD_RE = re.compile(r"^[\w.,:/@%+=-]+$")
+CRON_REDIRECT_RE = re.compile(r"^(?:\d*>>?|&>>?)(?:&\d+|[\w./-]*)$")
+CRON_INTERPRETER_RE = re.compile(r"^(?:python[\d.]*|env)$")
+CRON_BACKUP = SCRIPT_DIR / ".TugBoat.crontab.bak"
+
+
 def is_tugboat_cron(line: str) -> bool:
     text = line.strip()
-    return bool(text) and not text.startswith("#") and "--healthcheck" in text and SCRIPT_NAME in text
+    if not text or text.startswith("#"):
+        return False
+    match = CRON_SCHEDULE_RE.match(text)
+    if not match:
+        return False
+    try:
+        tokens = shlex.split(match.group(2))
+    except ValueError:
+        return False
+    found = next((i for i, token in enumerate(tokens) if os.path.basename(token) == SCRIPT_NAME), None)
+    if found is None or found + 1 >= len(tokens) or tokens[found + 1] != "--healthcheck":
+        return False
+    for token in tokens[:found]:
+        if not (CRON_ENV_RE.match(token) or CRON_INTERPRETER_RE.match(os.path.basename(token))):
+            return False
+    if not all(CRON_WORD_RE.match(t) or CRON_REDIRECT_RE.match(t) for t in tokens[found + 2:]):
+        return False
+    target = Path(tokens[found])
+    return not target.exists() or target.resolve() == Path(__file__).resolve()
 
 
 def read_crontab() -> str:
     try:
-        p = subprocess.run(["crontab", "-l"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                           timeout=30)
+        p = subprocess.run(["crontab", "-l"], capture_output=True, encoding="utf-8", errors="surrogateescape",
+                           stdin=subprocess.DEVNULL, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f"could not run crontab: {e}")
     if p.returncode == 0:
@@ -715,24 +740,50 @@ def read_crontab() -> str:
 def write_crontab(text: str) -> None:
     args = ["crontab", "-"] if text.strip() else ["crontab", "-r"]
     try:
-        p = subprocess.run(args, input=text, capture_output=True, text=True, timeout=30)
+        p = subprocess.run(args, input=text, capture_output=True, encoding="utf-8", errors="surrogateescape",
+                           timeout=30)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f"could not run crontab: {e}")
     if p.returncode != 0:
         raise RuntimeError(_last_line(p.stderr, f"{' '.join(args)} exit code {p.returncode}"))
 
 
-def plan_cron(current: str, line: str) -> tuple[str, str]:
-    lines = current.splitlines()
+def apply_crontab(current: str, updated: str) -> None:
+    if current.strip():
+        try:
+            CRON_BACKUP.write_bytes(current.encode("utf-8", "surrogateescape"))
+        except OSError as e:
+            raise RuntimeError(f"could not back up the crontab to {CRON_BACKUP} ({e.strerror or e}) - "
+                               "nothing was changed")
+    if read_crontab() != current:
+        raise RuntimeError("the crontab changed while TugBoat was reading it - nothing was changed")
+    write_crontab(updated)
+
+
+def cron_lines(text: str) -> list[str]:
+    if not text:
+        return []
+    return (text[:-1] if text.endswith("\n") else text).split("\n")
+
+
+def plan_cron(current: str, line: str | None) -> tuple[str, str]:
+    if line is not None and not is_tugboat_cron(line):
+        raise RuntimeError("the cron line TugBoat would write is not recognised as its own - "
+                           "nothing was changed")
+    lines = cron_lines(current)
+    others = [text for text in lines if not is_tugboat_cron(text)]
     hits = [i for i, text in enumerate(lines) if is_tugboat_cron(text)]
-    if not hits:
-        lines.append(line)
-        return "\n".join(lines) + "\n", ""
-    old = lines[hits[0]]
-    lines[hits[0]] = line
-    drop = set(hits[1:])
-    lines = [text for i, text in enumerate(lines) if i not in drop]
-    return "\n".join(lines) + "\n", old
+    old = lines[hits[0]] if hits else ""
+    if line is None:
+        result = others
+    elif not hits:
+        result = lines + [line]
+    else:
+        result = [line if i == hits[0] else text for i, text in enumerate(lines) if i not in hits[1:]]
+    if [text for text in result if not is_tugboat_cron(text)] != others:
+        raise RuntimeError("safety check failed: the change would touch lines that are not TugBoat's - "
+                           "nothing was changed")
+    return ("\n".join(result) + "\n" if result else ""), old
 
 
 def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
@@ -748,7 +799,7 @@ def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
         if updated.rstrip("\n") == current.rstrip("\n"):
             return "same", ""
         if not dry_run:
-            write_crontab(updated)
+            apply_crontab(current, updated)
     except RuntimeError as e:
         return "error", f"could not update the crontab: {e}"
     return ("updated" if old else "added"), old
@@ -794,16 +845,15 @@ def run_uninstall(cfg: Config, dry_run: bool) -> int:
         return 2
     try:
         current = read_crontab()
-        lines = current.splitlines()
-        kept = [line for line in lines if not is_tugboat_cron(line)]
+        updated, old = plan_cron(current, None)
         say()
-        if len(kept) == len(lines):
+        if not old:
             say(f"{green(SYM['ok'])} No TugBoat cron job found")
             return 0
         if dry_run:
             say(cyan(f"{SYM['dry']} Dry run - would remove the TugBoat cron job"))
             return 0
-        write_crontab("\n".join(kept) + "\n" if kept else "")
+        apply_crontab(current, updated)
         say(f"{green(SYM['ok'])} Cron job removed")
     except RuntimeError as e:
         say_error(f"Could not update the crontab: {e}")
