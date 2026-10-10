@@ -25,18 +25,19 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from http.client import HTTPException
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.6.3"
+__version__ = "0.7.1"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
 CONFIG_DEFAULTS = {
-    "stacks_directory": "., ./Stacks",
+    "stacks_directory": "",
     "require_root": "true",
     "status_file": "./TugBoat/tugboat.json",
     "ignore_folders": "",
@@ -57,12 +58,14 @@ CONFIG_DEFAULTS = {
     "install_dependencies": "true",
     "command_timeout": "0",
     "parallel_stacks": "4",
+    "error_actions": "true",
     "update_check": "true",
     "update_check_interval": "60",
     "auto_update": "true",
 }
 CONFIG_HELP = {
-    "stacks_directory": "Folders that hold your stacks, one '- \"path\"' line each (<folder>/<stack>/compose.yaml)",
+    "stacks_directory": "More folders that hold stacks, one '- \"path\"' line each "
+                        "(the script folder, ./Stacks, ./stacks and ./Stack are always searched)",
     "require_root": "Restart with sudo when not run as root",
     "status_file": "Where the status JSON is written",
     "ignore_folders": "Stack folder names to leave alone, one '- \"name\"' line each",
@@ -83,6 +86,7 @@ CONFIG_HELP = {
     "install_dependencies": "Install missing Docker, Compose plugin and cron (apt, dnf, pacman)",
     "command_timeout": "Seconds before a stop, start or update command is stopped (0 = no limit)",
     "parallel_stacks": "Stacks handled at the same time by update, start, stop and restart (1 = one by one)",
+    "error_actions": "Run the error actions from each stack's TugBoat.stack file during the health check",
     "update_check": "Look for a new TugBoat release",
     "update_check_interval": "Minutes between checks for a new TugBoat release",
     "auto_update": "Install new TugBoat releases automatically",
@@ -90,26 +94,21 @@ CONFIG_HELP = {
 CONFIG_GROUPS = (
     ("stacks_directory", "require_root", "status_file", "ignore_folders"),
     ("backup", "backup_path", "backup_retention", "backup_large_mb", "backup_large_retention"),
-    ("docker_user", "health_wait", "command_timeout", "parallel_stacks"),
+    ("docker_user", "health_wait", "command_timeout", "parallel_stacks", "error_actions"),
     ("image_check", "image_check_interval", "registry_timeout"),
     ("icons", "icon_index_days"),
     ("manage_cron", "healthcheck_interval", "install_dependencies"),
     ("update_check", "update_check_interval", "auto_update"),
 )
 PREVIOUS_DEFAULTS = {
-    "status_file": ["{container_path}/tugboat.json", "./tugboat.json"],
-    "backup_path": ["{container_path}/.backup/$STACK-NAME"],
     "backup_retention": ["10"],
     "backup_large_mb": ["0"],
     "backup_large_retention": ["2", "1"],
     "healthcheck_interval": ["5"],
 }
-OBSOLETE_CONFIG_KEYS = ("docker_stack_up_cmd", "docker_stack_down_cmd", "docker_stack_start_cmd",
-                        "docker_stack_restore_cmd")
-
-PINNED_CONFIG_KEYS = ("stacks_directory",)
-RENAMED_CONFIG_KEYS = {"container_path": "stacks_directory"}
+PINNED_CONFIG_KEYS = ("stacks_directory", "status_file", "backup_path")
 LIST_CONFIG_KEYS = ("stacks_directory", "ignore_folders")
+BUILTIN_STACK_DIRS = (".", "./Stacks", "./stacks", "./Stack")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -123,22 +122,9 @@ class Layout:
         self.cache = self.data / "cache"
         self.bin = self.data / "bin"
         self.cron_entry = self.bin / "cron.entry"
+        self.fixes = self.bin / "fixes.sh"
         self.config = self.data / "TugBoat.conf"
         self.old_config = root / "TugBoat.conf"
-
-    def old_files(self, conf: str, script: str) -> list[tuple[Path, Path]]:
-        pairs = [
-            (self.old_config, self.config),
-            (self.root / f".{conf}.bak", self.state / "config.bak"),
-            (self.root / f".{conf}.defaults", self.state / "config.defaults"),
-            (self.root / ".TugBoat.crontab.bak", self.state / "crontab.bak"),
-            (self.root / ".TugBoat.deps.failed", self.state / "deps.failed"),
-            (self.root / f".{script}.bak", self.state / "script-previous.bak"),
-        ]
-        for old in self.root.glob(f".{script}.*.bak"):
-            version = old.name[len(script) + 2:-len(".bak")]
-            pairs.append((old, self.state / f"script-{version}.bak"))
-        return pairs
 
 
 LAYOUT = Layout(SCRIPT_DIR)
@@ -152,40 +138,6 @@ def config_source() -> Path:
 def ensure_parent(path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def migrate_layout(layout: Layout, conf: str, script: str) -> int:
-    moved = 0
-    for old, new in layout.old_files(conf, script):
-        try:
-            if old.is_file() and not new.exists():
-                os.replace(old, ensure_parent(new))
-                moved += 1
-        except OSError:
-            pass
-    return moved
-
-
-def relocate_default_data(key: str, old: str, new: str, base: Path) -> bool:
-    source, target = base / Path(old).expanduser(), base / Path(new).expanduser()
-    try:
-        if key == "status_file":
-            if source.is_file() and not target.exists():
-                shutil.move(str(source), str(ensure_parent(target)))
-        elif key == "backup_path" and source.name == target.name == STACK_PLACEHOLDER:
-            if source.parent.is_dir():
-                for stack in sorted(d for d in source.parent.iterdir() if d.is_dir()):
-                    for item in sorted(stack.iterdir()):
-                        if not (target.parent / stack.name / item.name).exists():
-                            os.rename(item, ensure_parent(target.parent / stack.name / item.name))
-                    if not any(stack.iterdir()):
-                        stack.rmdir()
-                if not any(source.parent.iterdir()):
-                    source.parent.rmdir()
-    except OSError as e:
-        say(yellow(f"{SYM['warn']} {key} stays at {old}: could not move it to {new} ({e.strerror or e})"))
-        return False
-    return True
 
 
 COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
@@ -441,12 +393,15 @@ class Runner:
         return StepOutcome(ok is True, status == "warn", note, details, output, seconds)
 
 
-def command_work(cmd: str, cwd: Path) -> StepWork:
+def command_work(cmd: str, cwd: Path, env: dict | None = None, as_root: bool = False) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        run_as = {} if as_root else dict(DOCKER_RUN_AS)
+        if env:
+            run_as["env"] = {**(run_as.get("env") or os.environ), **env}
         proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                 text=True, errors="replace", bufsize=1,
-                                start_new_session=True, **DOCKER_RUN_AS)
+                                start_new_session=True, **run_as)
         assert proc.stdout is not None
         ctl = getattr(_STEP, "ctl", None)
         own = ctl.procs if ctl else set()
@@ -459,6 +414,7 @@ def command_work(cmd: str, cwd: Path) -> StepWork:
         finally:
             ACTIVE_PROCS.discard(proc)
             own.discard(proc)
+            proc.stdout.close()
         if cancelled():
             return False, "cancelled", []
         return rc == 0, "" if rc == 0 else f"exit code {rc}", []
@@ -469,6 +425,46 @@ GITHUB_REPO = __git__.rstrip("/").split("github.com/")[-1]
 GITHUB_API = "https://api.github.com"
 GITHUB_RAW = "https://raw.githubusercontent.com"
 UPDATED_ENV = "TUGBOAT_JUST_UPDATED"
+
+
+FIXES_RETRY_SECONDS = 3600
+SHIPPED_FILES = ("TugBoat/bin/cron.entry", "TugBoat/bin/fixes.sh")
+
+
+def run_fixes(verbose: bool, force: bool = False) -> bool | None:
+    done = LAYOUT.state / "fixes.done"
+    try:
+        content = LAYOUT.fixes.read_bytes()
+    except OSError:
+        return None
+    digest = hashlib.sha256(content).hexdigest()
+    try:
+        lock = open(ensure_parent(LAYOUT.state / "fixes.lock"), "ab")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    except OSError:
+        return None
+    try:
+        try:
+            last = done.read_text(encoding="utf-8").split()
+            recent = time.time() - done.stat().st_mtime < FIXES_RETRY_SECONDS
+        except OSError:
+            last, recent = [], False
+        if not force and last[:1] == [digest] and (last[1:2] == ["ok"] or recent):
+            return None
+        env = {"TUGBOAT_DIR": str(SCRIPT_DIR), "TUGBOAT_DATA": str(LAYOUT.data),
+               "TUGBOAT_CONFIG": str(CONFIG_FILE), "TUGBOAT_VERSION": __version__}
+        out = Runner(verbose, False).step(
+            "Fixes", command_work(f"sh {shlex.quote(str(LAYOUT.fixes))}", SCRIPT_DIR, env=env, as_root=True),
+            timeout=600)
+        for line in [] if verbose else out.output[-ERROR_TAIL_LINES:]:
+            say(dim(f"      {SYM['bar']} {line}"))
+        try:
+            done.write_text(f"{digest} {'ok' if out.ok else 'failed'}\n", encoding="utf-8")
+        except OSError:
+            pass
+        return out.ok
+    finally:
+        lock.close()
 
 
 def parse_version(v: str) -> tuple[int, ...]:
@@ -590,14 +586,16 @@ def install_release(rel: dict, dry_run: bool) -> bool:
         say_error(f"Could not replace {script}: {e}")
         return False
     say(f"  {green(SYM['ok'])} Installed {bold(rel['tag'])}  {dim(f'(old version kept as {backup.name})')}")
-    try:
-        entry = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/{CRON_ENTRY_URL}", 10).decode("utf-8-sig")
-        if any(l.strip() and not l.strip().startswith("#") for l in entry.splitlines()):
-            tmp_entry = ensure_parent(LAYOUT.cron_entry).with_name("cron.entry.new")
-            tmp_entry.write_text(entry, encoding="utf-8")
-            os.replace(tmp_entry, LAYOUT.cron_entry)
-    except (URLError, OSError, HTTPException, UnicodeDecodeError):
-        pass
+    for shipped in SHIPPED_FILES:
+        try:
+            data = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/{shipped}", 10)
+            if data.strip():
+                target = SCRIPT_DIR / shipped
+                tmp_file = ensure_parent(target).with_name(target.name + ".new")
+                tmp_file.write_bytes(data)
+                os.replace(tmp_file, target)
+        except (URLError, OSError, HTTPException):
+            pass
 
     try:
         example = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/TugBoat/TugBoat.conf", 10).decode("utf-8")
@@ -715,6 +713,7 @@ class Config:
     icons: bool
     icon_index_days: int
     parallel_stacks: int
+    error_actions: bool
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -804,7 +803,7 @@ def render_list(key: str, items: list[str], newline: str) -> str:
 def first_stacks_dir(raw: dict) -> str:
     key = "stacks_directory" if "stacks_directory" in raw or "container_path" not in raw else "container_path"
     items = config_list(raw, key) if key == "stacks_directory" else split_list(str(raw[key]))
-    return (items or [CONFIG_DEFAULTS["stacks_directory"]])[0]
+    return (items or ["."])[0]
 
 
 def config_default(key: str, raw: dict[str, str]) -> str:
@@ -853,9 +852,7 @@ def render_default_config(newline: str = "\r\n") -> str:
                         for group in CONFIG_GROUPS)
 
 
-def sync_config(path: Path, write: bool = True,
-                before_change: Callable[[str, str, str], bool] | None = None,
-                ) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
+def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[tuple[str, str, str]]]:
     exists = path.is_file()
     text = path.read_bytes().decode("utf-8") if exists else render_default_config()
     created = not exists
@@ -864,31 +861,16 @@ def sync_config(path: Path, write: bool = True,
     state = load_defaults_state(path)
     container = first_stacks_dir(raw)
     present: set[str] = set()
-    removed: list[str] = []
     changed: list[tuple[str, str, str]] = []
     kept: list[str] = []
     described = False
     for line in text.splitlines(keepends=True):
         match = None if line.lstrip("\ufeff").lstrip().startswith("#") else CONFIG_KEY_RE.match(line.lstrip("\ufeff"))
         key = match.group(1).lower() if match else ""
-        if key in RENAMED_CONFIG_KEYS:
-            new_key = RENAMED_CONFIG_KEYS[key]
-            if new_key in raw or new_key in present:
-                removed.append(key)
-                continue
-            changed.append((key, key, new_key))
-            line = line.replace(match.group(1), new_key, 1)
-            key = new_key
-        if key in OBSOLETE_CONFIG_KEYS:
-            removed.append(key)
-            continue
         if key:
             present.add(key)
         if key in CONFIG_HELP and not (kept and kept[-1].lstrip("\ufeff").lstrip().startswith("#")):
             kept.append(f"# {CONFIG_HELP[key]}{newline}")
-            described = True
-        if key in LIST_CONFIG_KEYS and line.split(":", 1)[1].split("#")[0].strip():
-            line = render_list(key, split_list(_strip_comment(line.split(":", 1)[1])), newline)
             described = True
         if (key in CONFIG_DEFAULTS and key in raw and key not in PINNED_CONFIG_KEYS
                 and key not in LIST_CONFIG_KEYS):
@@ -898,16 +880,15 @@ def sync_config(path: Path, write: bool = True,
                 olds = [state[key]] if key in state and state[key] != CONFIG_DEFAULTS[key] else []
             new_value = config_default(key, raw)
             was_default = raw[key] in [old.replace("{container_path}", container) for old in olds]
-            if raw[key] != new_value and was_default and (
-                    not write or before_change is None or before_change(key, raw[key], new_value)):
+            if raw[key] != new_value and was_default:
                 changed.append((key, raw[key], new_value))
                 line = replace_config_value(line, new_value)
         kept.append(line)
     missing = [key for key in CONFIG_DEFAULTS if key not in present]
-    if not (missing or removed or changed or described or created):
+    if not (missing or changed or described or created):
         if write and state != CONFIG_DEFAULTS:
             save_defaults_state(path)
-        return [], [], []
+        return [], []
     out = "".join(kept)
     if missing and out and not out.endswith(("\n", "\r")):
         out += newline
@@ -932,7 +913,18 @@ def sync_config(path: Path, write: bool = True,
             tmp.unlink(missing_ok=True)
             raise
         save_defaults_state(path)
-    return (list(CONFIG_DEFAULTS) if created else missing), removed, changed
+    return (list(CONFIG_DEFAULTS) if created else missing), changed
+
+
+def stack_dirs(base: Path, configured: list[Path]) -> list[Path]:
+    builtin = [base / name for name in BUILTIN_STACK_DIRS if (base / name).is_dir()] or [base]
+    seen = {d.resolve() for d in builtin}
+    extra = []
+    for folder in configured:
+        if folder.resolve() not in seen:
+            seen.add(folder.resolve())
+            extra.append(folder)
+    return [d if d != base / "." else base for d in builtin] + extra
 
 
 def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
@@ -951,7 +943,7 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         return base / Path(value).expanduser()
 
     return Config(
-        stacks_dirs=[resolve(d) for d in stacks] or [base],
+        stacks_dirs=stack_dirs(base, [resolve(d) for d in stacks]),
         backup=_parse_bool(get("backup"), "backup"),
         backup_path=str(resolve(get("backup_path") or config_default("backup_path", raw))),
         backup_retention=_parse_int(get("backup_retention"), "backup_retention"),
@@ -975,6 +967,7 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         icons=_parse_bool(get("icons"), "icons"),
         icon_index_days=max(1, _parse_int(get("icon_index_days"), "icon_index_days")),
         parallel_stacks=max(1, _parse_int(get("parallel_stacks"), "parallel_stacks")),
+        error_actions=_parse_bool(get("error_actions"), "error_actions"),
     )
 
 
@@ -1020,16 +1013,6 @@ def ensure_root(non_interactive: bool = False) -> None:
     say(yellow("Not running as root - restarting with sudo"))
     sudo = ["sudo", "-n"] if non_interactive else ["sudo"]
     os.execvp("sudo", [*sudo, sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
-
-
-def acquire_run_lock():
-    handle = open(CONFIG_FILE, "rb")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        raise RuntimeError("Another TugBoat run is changing stacks right now - try again when it is done")
-    return handle
 
 
 PACKAGES = {
@@ -1150,9 +1133,17 @@ def handle_dependencies(missing: list[str], cfg: Config, args: argparse.Namespac
     return remaining
 
 
-def action_running() -> bool:
+STACK_LOCK_WAIT = 3600
+_HELD = threading.local()
+
+
+def stack_lock_file(name: str) -> Path:
+    return LAYOUT.state / "locks" / f"{name}.lock"
+
+
+def stack_busy(name: str) -> bool:
     try:
-        handle = open(CONFIG_FILE, "rb")
+        handle = open(stack_lock_file(name), "rb")
     except OSError:
         return False
     try:
@@ -1162,6 +1153,43 @@ def action_running() -> bool:
     finally:
         handle.close()
     return False
+
+
+@contextmanager
+def stack_job(stack: Path, wait: float | None, ui: "Runner | None" = None):
+    held = getattr(_HELD, "names", None)
+    if held is None:
+        held = _HELD.names = set()
+    if wait is None or stack.name in held:
+        yield True
+        return
+    try:
+        handle = open(ensure_parent(stack_lock_file(stack.name)), "ab")
+    except OSError:
+        yield True
+        return
+    deadline = time.monotonic() + wait
+    told = False
+    got = False
+    try:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline or cancelled():
+                    break
+                if ui and not told:
+                    ui.skip("Waiting", "another job is running on this stack")
+                    told = True
+                time.sleep(0.5)
+        if got:
+            held.add(stack.name)
+        yield got
+    finally:
+        held.discard(stack.name) if got else None
+        handle.close()
 
 
 def acquire_healthcheck_lock():
@@ -1198,8 +1226,8 @@ def fmt_interval(minutes: int) -> str:
     return "every minute" if minutes == 1 else f"every {minutes} minutes"
 
 
-CRON_TEMPLATE = "{schedule} PATH={path} {python} {script} --healthcheck >/dev/null 2>&1\n"
-CRON_ENTRY_URL = "TugBoat/bin/cron.entry"
+CRON_TEMPLATE = "# TugBoat - healthcheck\n{schedule} PATH={path} {python} {script} --healthcheck >/dev/null 2>&1\n"
+CRON_COMMENT_RE = re.compile(r"^\s*#\s*tugboat\b", re.I)
 CRON_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
@@ -1209,7 +1237,7 @@ def cron_command() -> str:
             "--healthcheck >/dev/null 2>&1")
 
 
-def cron_template() -> str:
+def cron_template() -> list[str]:
     try:
         text = LAYOUT.cron_entry.read_text(encoding="utf-8-sig")
     except OSError:
@@ -1218,22 +1246,29 @@ def cron_template() -> str:
         except OSError:
             pass
         text = CRON_TEMPLATE
-    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
-    if not lines:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    commands = [line for line in lines if not line.startswith("#")]
+    if not commands:
         raise ValueError(f"{LAYOUT.cron_entry} has no cron line")
-    return lines[0]
+    comments = [line for line in lines[:lines.index(commands[0])] if CRON_COMMENT_RE.match(line)]
+    return comments + [commands[0]]
 
 
-def cron_line(cfg: Config) -> str:
+def cron_block(cfg: Config) -> list[str]:
     values = {key: ",".join(map(str, value)) if isinstance(value, (list, set)) else str(value)
               for key, value in vars(cfg).items()}
     values.update(schedule=cron_schedule(cfg.healthcheck_interval), path=CRON_PATH,
                   python=shlex.quote(sys.executable), script=shlex.quote(str(Path(__file__).resolve())),
                   script_dir=shlex.quote(str(SCRIPT_DIR)))
-    unknown = sorted({m for m in CRON_PLACEHOLDER_RE.findall(cron_template()) if m not in values})
+    template = cron_template()
+    unknown = sorted({m for line in template for m in CRON_PLACEHOLDER_RE.findall(line) if m not in values})
     if unknown:
         raise ValueError(f"unknown placeholder(s) in {LAYOUT.cron_entry.name}: " + ", ".join(f"{{{u}}}" for u in unknown))
-    return CRON_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], cron_template())
+    return [CRON_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], line) for line in template]
+
+
+def cron_line(cfg: Config) -> str:
+    return cron_block(cfg)[-1]
 
 
 CRON_ENV_RE = re.compile(r"^[A-Za-z_]\w*=[\w.,:/@%+=-]*$")
@@ -1308,21 +1343,35 @@ def cron_lines(text: str) -> list[str]:
     return (text[:-1] if text.endswith("\n") else text).split("\n")
 
 
-def plan_cron(current: str, line: str | None) -> tuple[str, str]:
-    if line is not None and not is_tugboat_cron(line):
+def plan_cron(current: str, entry: list[str] | str | None) -> tuple[str, str]:
+    block = [entry] if isinstance(entry, str) else list(entry or [])
+    if block and not (is_tugboat_cron(block[-1]) and all(CRON_COMMENT_RE.match(c) for c in block[:-1])):
         raise RuntimeError(f"the line in {LAYOUT.cron_entry} must run {SCRIPT_NAME} --healthcheck "
                            "without extra commands - nothing was changed")
     lines = cron_lines(current)
-    others = [text for text in lines if not is_tugboat_cron(text)]
     hits = [i for i, text in enumerate(lines) if is_tugboat_cron(text)]
+    own = set(hits)
+    for hit in hits:
+        above = hit - 1
+        while above >= 0 and CRON_COMMENT_RE.match(lines[above]):
+            own.add(above)
+            above -= 1
+    others = [text for i, text in enumerate(lines) if i not in own]
     old = lines[hits[0]] if hits else ""
-    if line is None:
-        result = others
-    elif not hits:
-        result = lines + [line]
-    else:
-        result = [line if i == hits[0] else text for i, text in enumerate(lines) if i not in hits[1:]]
-    if [text for text in result if not is_tugboat_cron(text)] != others:
+    result: list[str] = []
+    placed = not block
+    for i, text in enumerate(lines):
+        if i not in own:
+            result.append(text)
+        elif not placed:
+            result += block
+            placed = True
+    if not placed:
+        result += block
+    kept = list(result)
+    for text in block:
+        kept.remove(text)
+    if kept != others:
         raise RuntimeError("safety check failed: the change would touch lines that are not TugBoat's - "
                            "nothing was changed")
     return ("\n".join(result) + "\n" if result else ""), old
@@ -1330,21 +1379,21 @@ def plan_cron(current: str, line: str | None) -> tuple[str, str]:
 
 def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
     try:
-        line = cron_line(cfg)
+        block = cron_block(cfg)
     except ValueError as e:
         return "error", str(e)
     if shutil.which("crontab") is None:
         return "error", "crontab not found - install cron first (Debian/Ubuntu: apt install cron)"
     try:
         current = read_crontab()
-        updated, old = plan_cron(current, line)
+        updated, old = plan_cron(current, block)
         if updated.rstrip("\n") == current.rstrip("\n"):
             return "same", ""
         if not dry_run:
             apply_crontab(current, updated)
     except RuntimeError as e:
         return "error", f"could not update the crontab: {e}"
-    return ("updated" if old else "added"), old
+    return ("updated" if old else "added"), old or ""
 
 
 def describe_cron(cfg: Config, state: str, old: str, dry_run: bool = False) -> str:
@@ -2515,6 +2564,9 @@ class StatusDB:
         keys = ("images", "updates_available", "images_checked_at", "icon", "icon_url")
         self._set(name, {k: images[k] for k in keys if k in images})
 
+    def set_error_action(self, name: str, record: dict) -> None:
+        self._set(name, {"error_action": record})
+
     def set_action(self, res: StackResult, action: str) -> None:
         values: dict = {"last_action": {
             "action": action,
@@ -3116,6 +3168,359 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
     return res
 
 
+STACK_FILE = "TugBoat.stack"
+STACK_FILE_TEMPLATE = """# TugBoat.stack - what TugBoat does for this stack. Remove the "#" in front of the lines you want.
+# The steps run one at a time, top to bottom, and stop as soon as the stack is healthy again.
+#
+# actions:
+#   - error_action:
+#       trigger_on: not_running, unhealthy
+#       cooldown: 1h
+#       actions:
+#         - restart:
+#           retries: 3
+#           retry_delay: 30s
+#         - webhook: http://example.lan/api/tugboat/errors
+#         - delay: 5s
+#         - stack: restart other-stack
+#         - script: ./fix.sh
+#         - delay: 120s
+#         - reboot-host: true
+"""
+YAML_KEY_RE = re.compile(r"^([\w.-]+):(?:\s+(.*))?$")
+DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$")
+TRIGGERS = {"not_running": "stopped", "stopped": "stopped", "unhealthy": "unhealthy", "unknown": "unknown",
+            "starting": "starting"}
+ERROR_COOLDOWN = 3600
+OTHER_STACK_WAIT = 300
+
+
+def parse_yaml(text: str):
+    lines = []
+    for number, raw in enumerate(text.lstrip("﻿").splitlines(), 1):
+        body = _strip_comment(raw).rstrip()
+        if body.strip():
+            lines.append((len(body) - len(body.lstrip(" \t")), body.strip(), number))
+    return _yaml_block(lines, 0, lines[0][0])[0] if lines else None
+
+
+def _yaml_pair(lines: list, i: int, indent: int, match, target: dict, list_item: bool = False) -> int:
+    key, value = match.group(1), match.group(2)
+    nested = i < len(lines) and (lines[i][0] > indent or (
+        not list_item and lines[i][0] == indent and lines[i][1].startswith("-")))
+    if value is not None and value.strip():
+        target[key] = unquote(value)
+    elif nested:
+        target[key], i = _yaml_block(lines, i, lines[i][0])
+    else:
+        target[key] = None
+    return i
+
+
+def _yaml_block(lines: list, i: int, indent: int):
+    if lines[i][1].startswith("-"):
+        items = []
+        while i < len(lines) and lines[i][0] == indent and lines[i][1].startswith("-"):
+            rest = lines[i][1][1:].strip()
+            i += 1
+            match = YAML_KEY_RE.match(rest)
+            if not rest:
+                item = None
+                if i < len(lines) and lines[i][0] > indent:
+                    item, i = _yaml_block(lines, i, lines[i][0])
+            elif match:
+                item = {}
+                i = _yaml_pair(lines, i, indent, match, item, list_item=True)
+                while i < len(lines) and lines[i][0] > indent and not lines[i][1].startswith("-"):
+                    more = YAML_KEY_RE.match(lines[i][1])
+                    if not more:
+                        raise ValueError(f"line {lines[i][2]}: expected 'key: value'")
+                    i = _yaml_pair(lines, i + 1, lines[i][0], more, item)
+            else:
+                item = unquote(rest)
+            items.append(item)
+        return items, i
+    mapping: dict = {}
+    while i < len(lines) and lines[i][0] == indent and not lines[i][1].startswith("-"):
+        match = YAML_KEY_RE.match(lines[i][1])
+        if not match:
+            raise ValueError(f"line {lines[i][2]}: expected 'key: value'")
+        i = _yaml_pair(lines, i + 1, indent, match, mapping)
+    if i < len(lines) and lines[i][0] >= indent:
+        raise ValueError(f"line {lines[i][2]}: unexpected indentation")
+    return mapping, i
+
+
+def parse_duration(value: object, default: float) -> float:
+    if value is None or str(value).strip() == "":
+        return default
+    match = DURATION_RE.match(str(value).strip().lower())
+    if not match:
+        raise ValueError(f"'{value}' is not a duration (use 30s, 5m, 2h)")
+    return float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+
+@dataclass
+class ErrorRule:
+    triggers: set[str]
+    steps: list[tuple[str, str, dict]]
+    cooldown: float
+
+
+@dataclass
+class ErrorRun:
+    stack: Path
+    cfg: Config
+    ui: Runner
+    stacks: list[Path]
+    snap: dict
+    trigger: str
+    done: list[dict] = field(default_factory=list)
+
+
+def step_spec(item: object) -> tuple[str, str, dict]:
+    if isinstance(item, str):
+        name, _, value = item.partition(" ")
+        options: dict = {}
+    elif isinstance(item, dict) and item:
+        name = next(iter(item))
+        value = item[name]
+        options = {k: v for k, v in item.items() if k != name}
+        if isinstance(value, dict):
+            options.update(value)
+            value = ""
+    else:
+        raise ValueError("an action is empty")
+    name = name.rstrip(":").lower().replace("_", "-")
+    if name not in STEP_HANDLERS:
+        raise ValueError(f"unknown action '{name}' (known: {', '.join(STEP_HANDLERS)})")
+    return name, str(value or "").strip(), options
+
+
+def load_stack_file(stack: Path) -> list[ErrorRule]:
+    try:
+        text = (stack / STACK_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    data = parse_yaml(text)
+    entries = data.get("actions") if isinstance(data, dict) else None
+    rules: list[ErrorRule] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or "error_action" not in entry:
+            continue
+        body = entry["error_action"] if isinstance(entry["error_action"], dict) else entry
+        names = [n.strip().lower() for n in str(body.get("trigger_on") or "not_running, unhealthy").split(",")]
+        unknown = [n for n in names if n and n not in TRIGGERS]
+        if unknown:
+            raise ValueError(f"unknown trigger_on '{unknown[0]}' (known: {', '.join(TRIGGERS)})")
+        steps = body.get("actions")
+        rules.append(ErrorRule({TRIGGERS[n] for n in names if n},
+                               [step_spec(item) for item in (steps if isinstance(steps, list) else [])],
+                               parse_duration(body.get("cooldown"), ERROR_COOLDOWN)))
+    return rules
+
+
+def ensure_stack_file(stack: Path) -> None:
+    target = stack / STACK_FILE
+    try:
+        if target.exists():
+            return
+        target.write_text(STACK_FILE_TEMPLATE, encoding="utf-8")
+        owner = stack.stat()
+        os.chown(target, owner.st_uid, owner.st_gid)
+    except OSError:
+        pass
+
+
+def delay_work(seconds: float) -> StepWork:
+    def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        return (False, "cancelled", []) if wait_cancelled(seconds) else (True, "", [])
+    return work
+
+
+def webhook_work(url: str, payload: dict) -> StepWork:
+    def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        request = Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                          headers={"Content-Type": "application/json",
+                                   "User-Agent": f"{__title__}/{__version__}"})
+        try:
+            with urlopen(request, timeout=10) as response:
+                return True, f"HTTP {response.status}", []
+        except HTTPError as e:
+            return False, f"HTTP {e.code}", []
+        except (URLError, OSError, HTTPException, ValueError) as e:
+            return False, str(getattr(e, "reason", e)), []
+    return work
+
+
+def step_restart(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
+    retries = max(1, _parse_int(str(options.get("retries") or "1"), "retries"))
+    pause = parse_duration(options.get("retry_delay"), 0)
+    res = StackResult(run.stack.name, ok=False, status="not tried")
+    for attempt in range(1, retries + 1):
+        if attempt > 1 and pause and not run.ui.step(f"Wait {fmt_time(pause)}", delay_work(pause)).ok:
+            break
+        res = restart_stack(run.stack, run.cfg, run.ui)
+        if res.ok or cancelled():
+            break
+    return res.ok, f"{res.status} (try {attempt}/{retries})"
+
+
+def step_webhook(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
+    if not value.startswith(("http://", "https://")):
+        return False, "webhook needs an http(s) address"
+    payload = {"host": platform.node(), "stack": run.stack.name, "trigger": run.trigger,
+               "health": run.snap["health"], "summary": run.snap["summary"], "problems": run.snap["problems"],
+               "steps_done": run.done, "time": now_iso(), "tugboat_version": __version__}
+    out = run.ui.step("Webhook", webhook_work(value, payload))
+    return out.ok, out.note
+
+
+def step_delay(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
+    seconds = parse_duration(value, 0)
+    return run.ui.step(f"Delay {fmt_time(seconds)}", delay_work(seconds)).ok, ""
+
+
+def step_stack(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
+    action, _, target = value.partition(" ")
+    actions = {"stop": stop_stack, "start": start_stack, "restart": restart_stack,
+               "update": lambda stack, cfg, ui: update_stack(stack, cfg, cfg.backup, ui)}
+    targets = run.stacks if target.strip().lower() == "all" else [
+        s for s in run.stacks if s.name.lower() == target.strip().lower()]
+    if action not in actions or not targets:
+        return False, f"use 'stack: {'|'.join(actions)} <stack name|all>'"
+    failed = []
+    for stack in targets:
+        run.ui.out(f"  {cyan(SYM['arrow'])} {action} {stack.name}")
+        with stack_job(stack, OTHER_STACK_WAIT, run.ui) as free:
+            if not free or not actions[action](stack, run.cfg, run.ui).ok:
+                failed.append(stack.name)
+    return not failed, f"failed: {', '.join(failed)}" if failed else f"{action} {target}"
+
+
+def step_script(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
+    if not value:
+        return False, "script needs a path"
+    env = {"TUGBOAT_STACK": run.stack.name, "TUGBOAT_STACK_DIR": str(run.stack),
+           "TUGBOAT_HEALTH": run.snap["health"], "TUGBOAT_SUMMARY": run.snap["summary"],
+           "TUGBOAT_PROBLEMS": "\n".join(run.snap["problems"]), "TUGBOAT_STATUS_FILE": str(run.cfg.status_file)}
+    out = run.ui.step("Script", command_work(value, run.stack, env=env), timeout=run.cfg.command_timeout)
+    return out.ok, out.note
+
+
+def step_reboot(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
+    if value.lower() not in ("true", "yes", "1", "on"):
+        return True, "off"
+    if os.geteuid() != 0:
+        return False, "rebooting needs root"
+    for stack in run.stacks:
+        with stack_job(stack, 30, None):
+            run.ui.out(f"  {cyan(SYM['arrow'])} stop {stack.name}")
+            stop_containers(stack, run.cfg, run.ui)
+    out = run.ui.step("Reboot host", command_work("shutdown -r now || systemctl reboot", SCRIPT_DIR, as_root=True))
+    return out.ok, out.note or "rebooting"
+
+
+STEP_HANDLERS = {"restart": step_restart, "webhook": step_webhook, "delay": step_delay, "stack": step_stack,
+                 "script": step_script, "reboot-host": step_reboot}
+
+
+def error_chain(stack: Path, rule_: ErrorRule, snap: dict, cfg: Config, stacks: list[Path],
+                verbose: bool, started_at: str) -> tuple[list[str], dict, dict]:
+    lines: list[str] = []
+    ui = Runner(verbose, False, lines)
+    run = ErrorRun(stack, cfg, ui, stacks, snap, snap["health"])
+    record = {"started_at": started_at, "trigger": run.trigger, "recovered": False, "steps": run.done}
+    with stack_job(stack, 0, None) as free:
+        if not free:
+            record["skipped"] = True
+            ui.skip("Error actions", "another job is running on this stack")
+        for name, value, options in rule_.steps if free else []:
+            if cancelled():
+                break
+            try:
+                ok, note = STEP_HANDLERS[name](run, value, options)
+            except (ValueError, OSError) as e:
+                ok, note = False, str(e)
+                ui._line("fail", name, None, red(note))
+            run.done.append({"step": name, "ok": ok, "note": note})
+            if name == "reboot-host" and ok and note != "off":
+                break
+            run.snap = check_health(stack)
+            if run.snap["health"] == "healthy":
+                record["recovered"] = True
+                break
+        if free:
+            state = ("ok", "Recovered", dim) if record["recovered"] else ("fail", "Not recovered", red)
+            ui._line(state[0], state[1], None, state[2](run.snap["summary"]))
+    record["finished_at"] = now_iso()
+    return lines, record, run.snap
+
+
+def due_error_actions(selected: list[Path], db: StatusDB) -> list[tuple[Path, ErrorRule]]:
+    due = []
+    for stack in selected:
+        entry = db.stack(stack.name)
+        try:
+            rules = load_stack_file(stack)
+        except (OSError, ValueError) as e:
+            say(yellow(f"{SYM['warn']} {stack.name}/{STACK_FILE} ignored: {e}"))
+            continue
+        rule_ = next((r for r in rules if entry.get("health") in r.triggers and r.steps), None)
+        last_action = entry.get("last_action") or {}
+        stopped_on_purpose = (entry.get("health") == "stopped" and last_action.get("action") == "stop"
+                              and last_action.get("ok"))
+        if rule_ is None or stopped_on_purpose:
+            continue
+        last = entry.get("error_action") or {}
+        if last.get("finished_at") and not last.get("recovered") and not last.get("skipped") \
+                and is_fresh(last.get("started_at"), rule_.cooldown):
+            say(dim(f"  {stack.name}: error actions ran {fmt_ago(last.get('started_at'))} without fixing it - "
+                    f"next try after {fmt_time(rule_.cooldown)}"))
+            continue
+        due.append((stack, rule_))
+    return due
+
+
+def run_error_actions(selected: list[Path], db: StatusDB, cfg: Config, stacks: list[Path], verbose: bool) -> int:
+    due = due_error_actions(selected, db)
+    if due:
+        rule(f"Error actions ({len(due)})")
+        started = now_iso()
+        for stack, _ in due:
+            db.set_error_action(stack.name, {"started_at": started, "trigger": db.stack(stack.name).get("health"),
+                                             "recovered": False, "steps": []})
+        try:
+            db.save()
+        except OSError:
+            pass
+        pool = ThreadPoolExecutor(max_workers=min(cfg.parallel_stacks, len(due)))
+        waiting = {pool.submit(error_chain, stack, rule_, db.stack(stack.name), cfg, stacks, verbose, started): stack
+                   for stack, rule_ in due}
+        try:
+            while waiting:
+                done, _ = wait(set(waiting), timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in done:
+                    stack = waiting.pop(future)
+                    lines, record, snap = future.result()
+                    say(f"\n  {bold(stack.name)}")
+                    for line in lines:
+                        say(line)
+                    db.set_health(stack.name, snap)
+                    db.set_error_action(stack.name, record)
+                    try:
+                        db.save()
+                    except OSError:
+                        pass
+        except KeyboardInterrupt:
+            stop_active()
+            pool.shutdown(wait=True)
+            return 130
+        pool.shutdown(wait=True)
+        say()
+    return 1 if any(db.stack(s.name).get("problems") for s in selected) else 0
+
+
 def print_issue(issue: Issue, style: Callable[[str], str], sym: str) -> None:
     say(f"\n  {style(sym)} {bold(issue.stack)} {dim(SYM['arrow'])} {issue.step}: {style(issue.message)}")
     for d in issue.details:
@@ -3198,6 +3603,8 @@ def main() -> int:
                       help="set up the cron job that runs --healthcheck every healthcheck_interval "
                            "minutes (TugBoat also keeps it in line on every run, see manage_cron)")
     mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job")
+    mode.add_argument("--run-fixes", action="store_true",
+                      help="run TugBoat/bin/fixes.sh now (it also runs by itself whenever it changes)")
     mode.add_argument("--check-update", action="store_true",
                       help="check GitHub for a newer TugBoat release")
     mode.add_argument("--self-update", action="store_true",
@@ -3217,6 +3624,8 @@ def main() -> int:
     parser.add_argument("--to", metavar="BACKUP",
                         help="the backup to roll back to, by folder name or its start (rollback only)")
     images_opt = parser.add_mutually_exclusive_group()
+    parser.add_argument("--no-error-actions", action="store_true",
+                        help="do not run the error actions from the stacks' TugBoat.stack files")
     images_opt.add_argument("--no-image-check", action="store_true",
                             help="do not ask the registries for new image versions")
     images_opt.add_argument("--check-images", action="store_true",
@@ -3258,15 +3667,20 @@ def main() -> int:
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
         if not args.dry_run:
-            if migrate_layout(LAYOUT, LAYOUT.old_config.name, SCRIPT_NAME) and CONFIG_FILE.is_file() \
-                    and not LAYOUT.old_config.exists():
-                say(green(f"{SYM['ok']} Moved TugBoat's files into {LAYOUT.data}"))
+            fixed = run_fixes(args.verbose, force=args.run_fixes)
+            if fixed is False:
+                say(yellow(f"{SYM['warn']} {LAYOUT.fixes.name} failed - see above; "
+                           f"retry with --run-fixes"))
+            if fixed is not None:
+                cfg = load_config(config_source())
+        if args.run_fixes:
+            if args.dry_run or fixed is None:
+                say(dim(f"Nothing to run: {LAYOUT.fixes}"))
+            return 1 if not args.dry_run and fixed is False else 0
         conf_path = config_source()
         try:
             created = not conf_path.is_file()
-            added, removed, changed = sync_config(
-                conf_path, write=not args.dry_run,
-                before_change=lambda key, old, new: relocate_default_data(key, old, new, SCRIPT_DIR))
+            added, changed = sync_config(conf_path, write=not args.dry_run)
         except OSError as e:
             say(yellow(f"{SYM['warn']} Config not updated: {e.strerror or e}"))
         else:
@@ -3275,15 +3689,10 @@ def main() -> int:
                 say(green(f"{SYM['ok']} Default config {verb}created: {conf_path}"))
             elif added:
                 say(green(f"{SYM['ok']} Config: setting(s) {verb}added with defaults: {', '.join(added)}"))
-            if removed:
-                say(green(f"{SYM['ok']} Config: obsolete setting(s) {verb}removed: {', '.join(removed)}"))
             for key, old, new in changed:
-                if key in RENAMED_CONFIG_KEYS:
-                    say(green(f"{SYM['ok']} Config: {key} {verb}renamed to {new}"))
-                    continue
                 say(green(f"{SYM['ok']} Config: {key} {verb}moved to the new default: "
                           f"{old or '(empty)'} {SYM['arrow']} {new or '(empty)'}"))
-            if (added or removed or changed) and not args.dry_run:
+            if (added or changed) and not args.dry_run:
                 cfg = load_config(conf_path)
         if cfg.icons and not args.dry_run:
             ICONS = IconStore(LAYOUT.cache / "icons", cfg.status_file.parent, cfg.icon_index_days)
@@ -3301,6 +3710,9 @@ def main() -> int:
         db: StatusDB | None = None if args.dry_run else StatusDB(cfg.status_file)
         startup_update_check(cfg, args.dry_run, db)
         stacks = find_stacks(cfg.stacks_dirs, cfg.ignore_folders)
+        if cfg.error_actions and not args.dry_run:
+            for found_stack in stacks:
+                ensure_stack_file(found_stack)
         if cfg.manage_cron and not args.dry_run:
             state, old = ensure_cron(cfg, False)
             if state != "same":
@@ -3410,22 +3822,22 @@ def main() -> int:
         max_age = 0 if args.check_images else cfg.image_check_interval * 60
         check_lock = None
         if not args.dry_run:
-            if action_running():
-                say(yellow(f"{SYM['warn']} A start/stop/update is running - health check skipped"))
-                return 0
             check_lock = acquire_healthcheck_lock()
             if check_lock is None:
                 say(yellow(f"{SYM['warn']} Another health check is still running - skipped"))
                 return 0
-        return run_healthcheck(selected, db, image_check, max_age)
-
-    lock = None
-    if not args.dry_run:
-        try:
-            lock = acquire_run_lock()
-        except (OSError, RuntimeError) as e:
-            say_error(str(e))
-            return 2
+            busy = [s for s in selected if stack_busy(s.name)]
+            if busy:
+                say(dim(f"  Job running, not checked now: {', '.join(s.name for s in busy)}"))
+                selected = [s for s in selected if s not in busy]
+            if not selected:
+                return 0
+        code = run_healthcheck(selected, db, image_check, max_age)
+        if db and cfg.error_actions and not args.no_error_actions:
+            if check_lock:
+                check_lock.close()
+            code = run_error_actions(selected, db, cfg, stacks, args.verbose) or (2 if code == 2 else 0)
+        return code
 
     do_backup = cfg.backup and not args.skip_backup
     ui = Runner(verbose=args.verbose, dry_run=args.dry_run)
@@ -3480,18 +3892,22 @@ def main() -> int:
 
     def run_one(stack: Path, runner: Runner) -> StackResult:
         begun = time.monotonic()
-        if action == "stop":
-            res = stop_stack(stack, cfg, runner)
-        elif action == "start":
-            res = start_stack(stack, cfg, runner)
-        elif action == "restart":
-            res = restart_stack(stack, cfg, runner)
-        elif action == "rollback":
-            res = rollback_stack(stack, cfg, rollback_to, not args.skip_backup, runner)
-        elif action == "update":
-            res = update_stack(stack, cfg, do_backup, runner)
-        else:
-            raise ValueError(f"unknown action '{action}'")
+        with stack_job(stack, None if args.dry_run else STACK_LOCK_WAIT, runner) as free:
+            if not free:
+                res = StackResult(stack.name, ok=False, status="another job is still running on this stack")
+                res.errors.append(Issue(stack.name, "-", res.status))
+            elif action == "stop":
+                res = stop_stack(stack, cfg, runner)
+            elif action == "start":
+                res = start_stack(stack, cfg, runner)
+            elif action == "restart":
+                res = restart_stack(stack, cfg, runner)
+            elif action == "rollback":
+                res = rollback_stack(stack, cfg, rollback_to, not args.skip_backup, runner)
+            elif action == "update":
+                res = update_stack(stack, cfg, do_backup, runner)
+            else:
+                raise ValueError(f"unknown action '{action}'")
         res.seconds = time.monotonic() - begun
         return res
 
@@ -3597,7 +4013,6 @@ def main() -> int:
     print_report(results, pending, action, time.monotonic() - run_start, interrupted)
     if db:
         say(dim(f"Status written to {db.path}") + "\n")
-    del lock
 
     if interrupted:
         return 130

@@ -109,10 +109,6 @@ if [ -f "$CONF" ]; then
     if [ "${TUGBOAT_INSTALL_DEPS:-}" = "0" ]; then
         set_conf install_dependencies false
     fi
-    if [ -n "${TUGBOAT_CONTAINER_PATH:-}" ]; then
-        set_conf stacks_directory "$TUGBOAT_CONTAINER_PATH"
-        say "stacks_directory set to $TUGBOAT_CONTAINER_PATH"
-    fi
     if [ -n "$DOCKER_USER" ]; then
         set_conf docker_user "$DOCKER_USER"
         say "docker_user set to $DOCKER_USER"
@@ -130,13 +126,13 @@ else
     if [ -n "$DOCKER_USER" ]; then
         say "Docker commands will run as $DOCKER_USER (docker_user in TugBoat.conf)"
     fi
-    mkdir -p "$DIR/Stacks"
     say "Created $CONF"
 fi
 
 mkdir -p "$DIR/TugBoat/bin"
-fetch "$RAW/TugBoat/bin/cron.entry" "$TMP/cron.entry" && [ -s "$TMP/cron.entry" ] \
-    && cp "$TMP/cron.entry" "$DIR/TugBoat/bin/cron.entry"
+for file in cron.entry fixes.sh; do
+    fetch "$RAW/TugBoat/bin/$file" "$TMP/$file" && [ -s "$TMP/$file" ] && cp "$TMP/$file" "$DIR/TugBoat/bin/$file"
+done
 
 if [ -d "$(dirname "$LINK")" ]; then
     ln -sf "$SCRIPT" "$LINK"
