@@ -12,6 +12,7 @@ import os
 import platform
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -30,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -501,6 +502,7 @@ class Config:
     image_check: bool
     image_check_interval: int
     command_timeout: int
+    healthcheck_interval: int
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -578,6 +580,7 @@ def load_config(path: Path) -> Config:
         image_check=_parse_bool(raw.get("image_check", "true"), "image_check"),
         image_check_interval=_parse_int(raw.get("image_check_interval", "60"), "image_check_interval"),
         command_timeout=_parse_int(raw.get("command_timeout", "0"), "command_timeout"),
+        healthcheck_interval=_parse_int(raw.get("healthcheck_interval", "5"), "healthcheck_interval"),
     )
 
 
@@ -633,6 +636,161 @@ def acquire_run_lock():
         handle.close()
         raise RuntimeError("Another TugBoat run is changing stacks right now - try again when it is done")
     return handle
+
+
+def action_running() -> bool:
+    try:
+        handle = open(CONFIG_FILE, "rb")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        handle.close()
+    return False
+
+
+def acquire_healthcheck_lock():
+    handle = open(Path(__file__).resolve(), "rb")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+SCRIPT_NAME = Path(__file__).resolve().name
+CRON_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+CRON_SCHEDULE_RE = re.compile(r"^\s*(@\w+|\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s+(\S.*)$")
+
+
+def cron_schedule(minutes: int) -> str:
+    if minutes == 1:
+        return "* * * * *"
+    if 2 <= minutes <= 59:
+        return f"*/{minutes} * * * *"
+    if 60 <= minutes <= 1440 and minutes % 60 == 0:
+        hours = minutes // 60
+        return "0 * * * *" if hours == 1 else f"0 */{hours} * * *"
+    raise ValueError("healthcheck_interval must be 1-59 minutes or a whole number of hours "
+                     "(60, 120 ... 1440)")
+
+
+def fmt_interval(minutes: int) -> str:
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return "every hour" if hours == 1 else f"every {hours} hours"
+    return "every minute" if minutes == 1 else f"every {minutes} minutes"
+
+
+def cron_command() -> str:
+    script = Path(__file__).resolve()
+    return (f"PATH={CRON_PATH} {shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+            "--healthcheck >/dev/null 2>&1")
+
+
+def is_tugboat_cron(line: str) -> bool:
+    text = line.strip()
+    return bool(text) and not text.startswith("#") and "--healthcheck" in text and SCRIPT_NAME in text
+
+
+def read_crontab() -> str:
+    try:
+        p = subprocess.run(["crontab", "-l"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"could not run crontab: {e}")
+    if p.returncode == 0:
+        return p.stdout
+    if "no crontab" in p.stderr.lower():
+        return ""
+    raise RuntimeError(_last_line(p.stderr, f"crontab -l exit code {p.returncode}"))
+
+
+def write_crontab(text: str) -> None:
+    args = ["crontab", "-"] if text.strip() else ["crontab", "-r"]
+    try:
+        p = subprocess.run(args, input=text, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"could not run crontab: {e}")
+    if p.returncode != 0:
+        raise RuntimeError(_last_line(p.stderr, f"{' '.join(args)} exit code {p.returncode}"))
+
+
+def plan_cron(current: str, schedule: str) -> tuple[str, str]:
+    lines = current.splitlines()
+    hits = [i for i, line in enumerate(lines) if is_tugboat_cron(line)]
+    if not hits:
+        lines.append(f"{schedule} {cron_command()}")
+        return "\n".join(lines) + "\n", ""
+    match = CRON_SCHEDULE_RE.match(lines[hits[0]])
+    old = " ".join(match.group(1).split()) if match else ""
+    lines[hits[0]] = f"{schedule} {match.group(2)}" if match else f"{schedule} {cron_command()}"
+    drop = set(hits[1:])
+    lines = [line for i, line in enumerate(lines) if i not in drop]
+    return "\n".join(lines) + "\n", old
+
+
+def run_install(cfg: Config, dry_run: bool) -> int:
+    try:
+        schedule = cron_schedule(cfg.healthcheck_interval)
+    except ValueError as e:
+        say_error(str(e))
+        return 2
+    if shutil.which("crontab") is None:
+        say_error("crontab not found - install cron first (Debian/Ubuntu: apt install cron)")
+        return 2
+    if not cfg.container_path.is_dir():
+        say_error(f"container_path does not exist: {cfg.container_path} - "
+                  f"edit {CONFIG_FILE} and run --install again")
+        return 2
+    every = fmt_interval(cfg.healthcheck_interval)
+    try:
+        current = read_crontab()
+        updated, old = plan_cron(current, schedule)
+        say()
+        if updated.rstrip("\n") == current.rstrip("\n"):
+            say(f"{green(SYM['ok'])} Health check already runs {every}")
+        elif dry_run:
+            verb = "change to" if old else "add"
+            say(cyan(f"{SYM['dry']} Dry run - would {verb} a cron job that runs the health check {every}"))
+        else:
+            write_crontab(updated)
+            if old:
+                say(f"{green(SYM['ok'])} Cron job updated: {dim(old)} {SYM['arrow']} {schedule}  ({every})")
+            else:
+                say(f"{green(SYM['ok'])} Cron job added: health check {every}")
+    except RuntimeError as e:
+        say_error(f"Could not update the crontab: {e}")
+        return 2
+    say(dim(f"  Change healthcheck_interval in {CONFIG_FILE.name} and run --install again to change it"))
+    return 0
+
+
+def run_uninstall(dry_run: bool) -> int:
+    if shutil.which("crontab") is None:
+        say_error("crontab not found")
+        return 2
+    try:
+        current = read_crontab()
+        lines = current.splitlines()
+        kept = [line for line in lines if not is_tugboat_cron(line)]
+        say()
+        if len(kept) == len(lines):
+            say(f"{green(SYM['ok'])} No TugBoat cron job found")
+            return 0
+        if dry_run:
+            say(cyan(f"{SYM['dry']} Dry run - would remove the TugBoat cron job"))
+            return 0
+        write_crontab("\n".join(kept) + "\n" if kept else "")
+        say(f"{green(SYM['ok'])} Cron job removed")
+    except RuntimeError as e:
+        say_error(f"Could not update the crontab: {e}")
+        return 2
+    return 0
 
 
 def find_stacks(root: Path, ignore: set[str] = frozenset()) -> list[Path]:
@@ -1980,6 +2138,10 @@ def main() -> int:
     mode.add_argument("--healthcheck", nargs="*", metavar="STACK",
                       help="check status/health and new image versions, write the status file "
                            "(all stacks if no names)")
+    mode.add_argument("--install", action="store_true",
+                      help="add (or update) the cron job that runs the health check "
+                           "every healthcheck_interval minutes")
+    mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job")
     mode.add_argument("--check-update", action="store_true",
                       help="check GitHub for a newer TugBoat release")
     mode.add_argument("--self-update", action="store_true",
@@ -2004,6 +2166,11 @@ def main() -> int:
                         version=f"{__title__} {__version__} - {__author__} - {__git__}")
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, _on_sigterm)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
     try:
         if args.check_update:
@@ -2017,11 +2184,22 @@ def main() -> int:
             return run_self_update(args.dry_run)
         cfg = load_config(CONFIG_FILE)
         if cfg.require_root and not args.dry_run:
-            ensure_root(non_interactive=args.auto)
+            ensure_root(non_interactive=args.auto or not sys.stdin.isatty())
         banner()
         user_warning = setup_docker_user(cfg.docker_user)
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
+        if args.uninstall:
+            return run_uninstall(args.dry_run)
+        if args.install:
+            code = run_install(cfg, args.dry_run)
+            if code or args.dry_run:
+                return code
+            found = find_stacks(cfg.container_path, cfg.ignore_folders)
+            if found:
+                run_healthcheck(found, StatusDB(cfg.status_file), cfg.image_check,
+                                cfg.image_check_interval * 60)
+            return 0
         db: StatusDB | None = None if args.dry_run else StatusDB(cfg.status_file)
         startup_update_check(cfg, args.dry_run, db)
         stacks = find_stacks(cfg.container_path, cfg.ignore_folders)
@@ -2079,6 +2257,15 @@ def main() -> int:
     image_check = (cfg.image_check or args.check_images) and not args.no_image_check
     if action == "healthcheck":
         max_age = 0 if args.check_images else cfg.image_check_interval * 60
+        check_lock = None
+        if not args.dry_run:
+            if action_running():
+                say(yellow(f"{SYM['warn']} A start/stop/update is running - health check skipped"))
+                return 0
+            check_lock = acquire_healthcheck_lock()
+            if check_lock is None:
+                say(yellow(f"{SYM['warn']} Another health check is still running - skipped"))
+                return 0
         return run_healthcheck(selected, db, image_check, max_age)
 
     lock = None
