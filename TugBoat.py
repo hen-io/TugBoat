@@ -31,17 +31,17 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.5.5"
+__version__ = "0.6.0"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
 CONFIG_DEFAULTS = {
-    "container_path": "/container-data",
+    "container_path": ".",
     "require_root": "true",
-    "status_file": "{container_path}/tugboat.json",
+    "status_file": "./TugBoat/tugboat.json",
     "ignore_folders": "",
     "backup": "true",
-    "backup_path": "{container_path}/.backup/$STACK-NAME",
+    "backup_path": "./TugBoat/backups/$STACK-NAME",
     "backup_retention": "15",
     "backup_large_mb": "250",
     "backup_large_retention": "5",
@@ -50,6 +50,8 @@ CONFIG_DEFAULTS = {
     "image_check": "true",
     "image_check_interval": "60",
     "registry_timeout": "10",
+    "icons": "true",
+    "icon_index_days": "7",
     "manage_cron": "true",
     "healthcheck_interval": "1",
     "install_dependencies": "true",
@@ -59,6 +61,8 @@ CONFIG_DEFAULTS = {
     "auto_update": "true",
 }
 PREVIOUS_DEFAULTS = {
+    "status_file": ["{container_path}/tugboat.json", "./tugboat.json"],
+    "backup_path": ["{container_path}/.backup/$STACK-NAME"],
     "backup_retention": ["10"],
     "backup_large_mb": ["0"],
     "backup_large_retention": ["2", "1"],
@@ -67,8 +71,75 @@ PREVIOUS_DEFAULTS = {
 OBSOLETE_CONFIG_KEYS = ("docker_stack_up_cmd", "docker_stack_down_cmd", "docker_stack_start_cmd",
                         "docker_stack_restore_cmd")
 
+PINNED_CONFIG_KEYS = ("container_path",)
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "TugBoat.conf"
+
+
+class Layout:
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.data = root / "TugBoat"
+        self.state = self.data / "state"
+        self.cache = self.data / "cache"
+
+    def old_files(self, conf: str, script: str) -> list[tuple[Path, Path]]:
+        pairs = [
+            (self.root / f".{conf}.bak", self.state / "config.bak"),
+            (self.root / f".{conf}.defaults", self.state / "config.defaults"),
+            (self.root / ".TugBoat.crontab.bak", self.state / "crontab.bak"),
+            (self.root / ".TugBoat.deps.failed", self.state / "deps.failed"),
+            (self.root / f".{script}.bak", self.state / "script-previous.bak"),
+        ]
+        for old in self.root.glob(f".{script}.*.bak"):
+            version = old.name[len(script) + 2:-len(".bak")]
+            pairs.append((old, self.state / f"script-{version}.bak"))
+        return pairs
+
+
+LAYOUT = Layout(SCRIPT_DIR)
+
+
+def ensure_parent(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def migrate_layout(layout: Layout, conf: str, script: str) -> int:
+    moved = 0
+    for old, new in layout.old_files(conf, script):
+        try:
+            if old.is_file() and not new.exists():
+                os.replace(old, ensure_parent(new))
+                moved += 1
+        except OSError:
+            pass
+    return moved
+
+
+def relocate_default_data(key: str, old: str, new: str, base: Path) -> bool:
+    source, target = base / Path(old).expanduser(), base / Path(new).expanduser()
+    try:
+        if key == "status_file":
+            if source.is_file() and not target.exists():
+                shutil.move(str(source), str(ensure_parent(target)))
+        elif key == "backup_path" and source.name == target.name == STACK_PLACEHOLDER:
+            if source.parent.is_dir():
+                for stack in sorted(d for d in source.parent.iterdir() if d.is_dir()):
+                    for item in sorted(stack.iterdir()):
+                        if not (target.parent / stack.name / item.name).exists():
+                            os.rename(item, ensure_parent(target.parent / stack.name / item.name))
+                    if not any(stack.iterdir()):
+                        stack.rmdir()
+                if not any(source.parent.iterdir()):
+                    source.parent.rmdir()
+    except OSError as e:
+        say(yellow(f"{SYM['warn']} {key} stays at {old}: could not move it to {new} ({e.strerror or e})"))
+        return False
+    return True
+
 
 COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 TIMESTAMP_FORMAT = "%d_%m_%y_%H_%M_%S"
@@ -405,10 +476,10 @@ def install_release(rel: dict, dry_run: bool) -> bool:
         return True
 
     st = script.stat()
-    backup = script.with_name(f".{script.name}.{__version__}.bak")
+    backup = LAYOUT.state / f"script-{__version__}.bak"
     tmp = script.with_name(f".{script.name}.new")
     try:
-        shutil.copy2(script, backup)
+        shutil.copy2(script, ensure_parent(backup))
         tmp.write_bytes(raw)
         os.chmod(tmp, st.st_mode)
         try:
@@ -547,6 +618,8 @@ class Config:
     update_check_interval: int
     registry_timeout: int
     install_dependencies: bool
+    icons: bool
+    icon_index_days: int
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -603,7 +676,7 @@ def config_default(key: str, raw: dict[str, str]) -> str:
 
 
 def defaults_state_path(path: Path) -> Path:
-    return path.with_name(f".{path.name}.defaults")
+    return Layout(path.parent).state / "config.defaults"
 
 
 def load_defaults_state(path: Path) -> dict[str, str] | None:
@@ -618,7 +691,7 @@ def save_defaults_state(path: Path) -> None:
     target = defaults_state_path(path)
     tmp = target.with_name(target.name + ".new")
     try:
-        tmp.write_text(json.dumps(CONFIG_DEFAULTS, indent=2) + "\n", encoding="utf-8")
+        ensure_parent(tmp).write_text(json.dumps(CONFIG_DEFAULTS, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, target)
     except OSError:
         tmp.unlink(missing_ok=True)
@@ -634,7 +707,9 @@ def replace_config_value(line: str, new: str) -> str:
     return f"{bom}{head}: {new}".rstrip() + (f"  {comment}" if comment else "") + ending
 
 
-def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
+def sync_config(path: Path, write: bool = True,
+                before_change: Callable[[str, str, str], bool] | None = None,
+                ) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
     exists = path.is_file()
     text = path.read_bytes().decode("utf-8") if exists else ""
     raw = parse_config_text(text, path.name)
@@ -653,13 +728,15 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str], l
             continue
         if key:
             present.add(key)
-        if key in CONFIG_DEFAULTS and key in raw:
+        if key in CONFIG_DEFAULTS and key in raw and key not in PINNED_CONFIG_KEYS:
             if state is None:
                 olds = PREVIOUS_DEFAULTS.get(key, [])
             else:
                 olds = [state[key]] if key in state and state[key] != CONFIG_DEFAULTS[key] else []
             new_value = config_default(key, raw)
-            if raw[key] != new_value and raw[key] in [old.replace("{container_path}", container) for old in olds]:
+            was_default = raw[key] in [old.replace("{container_path}", container) for old in olds]
+            if raw[key] != new_value and was_default and (
+                    not write or before_change is None or before_change(key, raw[key], new_value)):
                 changed.append((key, raw[key], new_value))
                 line = replace_config_value(line, new_value)
         kept.append(line)
@@ -676,7 +753,7 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str], l
         tmp = path.with_name(f".{path.name}.new")
         try:
             if exists:
-                path.with_name(f".{path.name}.bak").write_bytes(text.encode("utf-8"))
+                ensure_parent(Layout(path.parent).state / "config.bak").write_bytes(text.encode("utf-8"))
             tmp.write_bytes(out.encode("utf-8"))
             if exists:
                 st = path.stat()
@@ -729,6 +806,8 @@ def load_config(path: Path) -> Config:
         update_check_interval=_parse_int(get("update_check_interval"), "update_check_interval"),
         registry_timeout=max(1, _parse_int(get("registry_timeout"), "registry_timeout")),
         install_dependencies=_parse_bool(get("install_dependencies"), "install_dependencies"),
+        icons=_parse_bool(get("icons"), "icons"),
+        icon_index_days=max(1, _parse_int(get("icon_index_days"), "icon_index_days")),
     )
 
 
@@ -796,7 +875,7 @@ SERVICES = {
     "docker": {"apt-get": "docker", "dnf": "docker", "pacman": "docker"},
     "cron": {"apt-get": "cron", "dnf": "crond", "pacman": "cronie"},
 }
-DEPS_FAILED = SCRIPT_DIR / ".TugBoat.deps.failed"
+DEPS_FAILED = LAYOUT.state / "deps.failed"
 DEPS_RETRY_SECONDS = 3600
 DEPS_TIMEOUT = 900
 
@@ -896,7 +975,7 @@ def handle_dependencies(missing: list[str], cfg: Config, args: argparse.Namespac
     if not args.dry_run:
         try:
             if remaining:
-                DEPS_FAILED.write_text(", ".join(remaining) + "\n", encoding="utf-8")
+                ensure_parent(DEPS_FAILED).write_text(", ".join(remaining) + "\n", encoding="utf-8")
             else:
                 DEPS_FAILED.unlink(missing_ok=True)
         except OSError:
@@ -962,7 +1041,7 @@ CRON_ENV_RE = re.compile(r"^[A-Za-z_]\w*=[\w.,:/@%+=-]*$")
 CRON_WORD_RE = re.compile(r"^[\w.,:/@%+=-]+$")
 CRON_REDIRECT_RE = re.compile(r"^(?:\d*>>?|&>>?)(?:&\d+|[\w./-]*)$")
 CRON_INTERPRETER_RE = re.compile(r"^(?:python[\d.]*|env)$")
-CRON_BACKUP = SCRIPT_DIR / ".TugBoat.crontab.bak"
+CRON_BACKUP = LAYOUT.state / "crontab.bak"
 
 
 def is_tugboat_cron(line: str) -> bool:
@@ -1015,7 +1094,7 @@ def write_crontab(text: str) -> None:
 def apply_crontab(current: str, updated: str) -> None:
     if current.strip():
         try:
-            CRON_BACKUP.write_bytes(current.encode("utf-8", "surrogateescape"))
+            ensure_parent(CRON_BACKUP).write_bytes(current.encode("utf-8", "surrogateescape"))
         except OSError as e:
             raise RuntimeError(f"could not back up the crontab to {CRON_BACKUP} ({e.strerror or e}) - "
                                "nothing was changed")
@@ -1134,6 +1213,7 @@ def find_stacks(root: Path, ignore: set[str] = frozenset()) -> list[Path]:
     return sorted(
         (d for d in root.iterdir()
          if d.is_dir() and not d.name.startswith(".") and d.name not in ignore
+         and d.resolve() != LAYOUT.data.resolve()
          and any((d / f).is_file() for f in COMPOSE_FILES)),
         key=lambda d: d.name.lower(),
     )
@@ -1839,7 +1919,7 @@ def local_image(image: str) -> LocalImage | None:
 
 def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
     info = {"status": "unknown", "local_digest": "", "remote_digest": "", "detail": "", "id": "",
-            "local_version": "", "remote_version": "", "source_url": ""}
+            "local_version": "", "remote_version": "", "source_url": "", "label_icon": ""}
     ref = parse_image_ref(image)
     local: LocalImage | None = None
     try:
@@ -1863,6 +1943,7 @@ def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
             info["status"] = "up_to_date" if remote in local.digests else "update_available"
         if local:
             info["id"] = local.id
+            info["label_icon"] = next((str(local.labels[k]) for k in ICON_IMAGE_LABELS if local.labels.get(k)), "")
     except RegistryError as e:
         info["detail"] = str(e)
     if ref is not None:
@@ -1870,14 +1951,163 @@ def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
     return info
 
 
+ICON_LABEL = "tugboat.icon"
+ICON_IMAGE_LABELS = ("net.unraid.docker.icon", "io.artifacthub.package.logo-url")
+ICON_FORMATS = ("svg", "png", "webp")
+ICON_TYPES = {"image/svg+xml": "svg", "image/png": "png", "image/webp": "webp", "image/jpeg": "jpg",
+              "image/gif": "gif", "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico"}
+ICON_MAX_BYTES = 1024 * 1024
+ICON_INDEX_MAX_BYTES = 16 * 1024 * 1024
+ICON_PREFIXES = ("docker-",)
+ICON_SUFFIXES = ("-docker", "-server", "-app", "-ce", "-oss", "-web", "-ui")
+ICON_GENERIC = {"server", "app", "core", "backend", "frontend", "web", "api", "base", "main", "latest", "stable",
+                "docker", "db", "database", "proxy", "worker", "client", "service", "agent", "image", "library"}
+ICON_ERRORS = (URLError, OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError)
+NO_ICON = {"icon": "", "icon_url": ""}
+
+
+def icon_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def icon_names(*names: str) -> list[str]:
+    found: list[str] = []
+    for name in names:
+        key = icon_key(name)
+        short = key
+        for prefix in ICON_PREFIXES:
+            short = short[len(prefix):] if short.startswith(prefix) else short
+        for suffix in ICON_SUFFIXES:
+            short = short[:-len(suffix)] if short.endswith(suffix) else short
+        for candidate in (key, short):
+            if candidate and candidate not in ICON_GENERIC and candidate not in found:
+                found.append(candidate)
+    return found
+
+
+class DashboardIcons:
+    name = "dashboard-icons"
+    base = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons"
+
+    def load(self, fetch: Callable[[str, int], bytes]) -> dict:
+        tree = json.loads(fetch(f"{self.base}/tree.json", ICON_INDEX_MAX_BYTES))
+        icons: dict[str, str] = {}
+        for ext in reversed(ICON_FORMATS):
+            for file in tree.get(ext) or []:
+                icons[str(file).rsplit(".", 1)[0]] = ext
+        aliases: dict[str, str] = {}
+        try:
+            meta = json.loads(fetch(f"{self.base}/metadata.json", ICON_INDEX_MAX_BYTES))
+        except ICON_ERRORS:
+            meta = {}
+        for name, item in meta.items():
+            for alias in (item or {}).get("aliases") or []:
+                aliases.setdefault(icon_key(str(alias)), name)
+        return {"icons": icons, "aliases": aliases}
+
+    def url(self, name: str, ext: str) -> str:
+        return f"{self.base}/{ext}/{name}.{ext}"
+
+
+ICON_PROVIDERS = (DashboardIcons(),)
+
+
+class IconStore:
+    def __init__(self, folder: Path, base: Path, index_days: int, providers: tuple = ICON_PROVIDERS):
+        self.folder = folder
+        self.base = base
+        self.max_age = index_days * 86400
+        self.providers = providers
+        self._indexes: dict[str, dict] = {}
+
+    def fetch(self, url: str, limit: int) -> bytes:
+        with _http_open(url, REGISTRY_TIMEOUT) as r:
+            data = r.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("file is too big")
+        return data
+
+    def index(self, provider) -> dict:
+        if provider.name in self._indexes:
+            return self._indexes[provider.name]
+        file = self.folder / f"index-{provider.name}.json"
+        data = None
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            fresh = time.time() - file.stat().st_mtime < self.max_age
+        except (OSError, ValueError):
+            fresh = False
+        if not fresh or not isinstance(data, dict):
+            try:
+                data = provider.load(self.fetch)
+                ensure_parent(file).write_text(json.dumps(data), encoding="utf-8")
+            except ICON_ERRORS:
+                data = data if isinstance(data, dict) else {}
+        self._indexes[provider.name] = data
+        return data
+
+    def relative(self, file: Path) -> str:
+        return os.path.relpath(file, self.base)
+
+    def download(self, url: str, stem: str, ext: str = "") -> dict:
+        existing = [self.folder / f"{stem}.{ext}"] if ext else sorted(self.folder.glob(f"{stem}.*"))
+        existing = [f for f in existing if f.is_file()]
+        if existing:
+            return {"icon": self.relative(existing[0]), "icon_url": url}
+        with _http_open(url, REGISTRY_TIMEOUT) as r:
+            kind = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            data = r.read(ICON_MAX_BYTES + 1)
+        if kind not in ICON_TYPES or not data or len(data) > ICON_MAX_BYTES:
+            raise ValueError("not a usable picture")
+        file = self.folder / f"{stem}.{ext or ICON_TYPES[kind]}"
+        tmp = file.with_name(file.name + ".new")
+        ensure_parent(tmp).write_bytes(data)
+        os.replace(tmp, file)
+        return {"icon": self.relative(file), "icon_url": url}
+
+    def find(self, names: list[str]) -> dict:
+        for provider in self.providers:
+            index = self.index(provider)
+            icons, aliases = index.get("icons") or {}, index.get("aliases") or {}
+            for name in names:
+                match = name if name in icons else aliases.get(name)
+                if match in icons:
+                    return self.download(provider.url(match, icons[match]), match, icons[match])
+        return dict(NO_ICON)
+
+    def lookup(self, override: str, names: list[str], prior: dict) -> dict:
+        try:
+            if override.startswith(("http://", "https://")):
+                return self.download(override, "url-" + hashlib.sha1(override.encode()).hexdigest()[:12])
+            if override:
+                return self.find(icon_names(override))
+            if prior.get("icon") and (self.base / str(prior["icon"])).is_file():
+                return {"icon": str(prior["icon"]), "icon_url": str(prior.get("icon_url") or "")}
+            return self.find(names)
+        except ICON_ERRORS:
+            return dict(NO_ICON)
+
+
+ICONS: IconStore | None = None
+
+
+def image_icon_names(image: str, entry: dict) -> list[str]:
+    ref = parse_image_ref(image)
+    repo = ref.repo.split("/") if ref else []
+    return icon_names(*repo[-1:], *repo[-2:-1], *entry.get("names", []))
+
+
 def declared_images(stack: Path, containers: list[dict]) -> dict[str, dict]:
     found: dict[str, dict] = {}
 
-    def add(image: str, service: str, built: bool) -> None:
-        entry = found.setdefault(image, {"services": [], "built": False})
+    def add(image: str, service: str, built: bool, spec: dict | None = None) -> None:
+        entry = found.setdefault(image, {"services": [], "built": False, "names": [], "icon": ""})
         if service and service not in entry["services"]:
             entry["services"].append(service)
         entry["built"] = entry["built"] or built
+        labels = (spec or {}).get("labels")
+        entry["icon"] = entry["icon"] or str((labels if isinstance(labels, dict) else {}).get(ICON_LABEL) or "")
+        entry["names"] += [n for n in (service, str((spec or {}).get("container_name") or "")) if n]
 
     rc, out, _ = docker(["compose", "config", "--format", "json"], cwd=stack)
     try:
@@ -1887,7 +2117,7 @@ def declared_images(stack: Path, containers: list[dict]) -> dict[str, dict]:
     if isinstance(services, dict):
         for name, spec in services.items():
             if isinstance(spec, dict) and spec.get("image"):
-                add(str(spec["image"]), name, "build" in spec)
+                add(str(spec["image"]), name, "build" in spec, spec)
         return found
     for c in containers:
         if c["image"]:
@@ -1938,12 +2168,23 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
             image_id = info.pop("id")
             if info["status"] == "up_to_date" and in_use.get(image) and image_id not in in_use[image]:
                 info.update(status="update_available", detail="new image is pulled, containers still run the old one")
+            info.update(NO_ICON)
+            if ICONS:
+                info.update(ICONS.lookup(entry["icon"] or info["label_icon"], image_icon_names(image, entry),
+                                         prior.get(image) or {}))
             images.append({k: info[k] for k in ("image", "services", "status", "local_version", "remote_version",
-                                                "local_digest", "remote_digest", "source_url", "detail")})
+                                                "local_digest", "remote_digest", "source_url", "icon", "icon_url",
+                                                "detail")})
+        stack_icon = dict(NO_ICON)
+        if ICONS:
+            stack_icon = ICONS.lookup("", icon_names(name), db.stack(name) if db else {})
+            if not stack_icon["icon"]:
+                stack_icon = next(({k: i[k] for k in NO_ICON} for i in images if i["icon"]), stack_icon)
         result[name] = {
             "images": images,
             "updates_available": sum(i["status"] in IMAGE_OUTDATED for i in images),
             "images_checked_at": now_iso(),
+            **stack_icon,
         }
     return result
 
@@ -2033,7 +2274,8 @@ class StatusDB:
         self._set(name, {k: snapshot[k] for k in ("health", "summary", "problems", "checked_at", "containers")})
 
     def set_images(self, name: str, images: dict) -> None:
-        self._set(name, {k: images[k] for k in ("images", "updates_available", "images_checked_at")})
+        keys = ("images", "updates_available", "images_checked_at", "icon", "icon_url")
+        self._set(name, {k: images[k] for k in keys if k in images})
 
     def set_action(self, res: StackResult, action: str) -> None:
         values: dict = {"last_action": {
@@ -2077,7 +2319,7 @@ class StatusDB:
         data["written_at"] = now_iso()
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         try:
-            tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            ensure_parent(tmp).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
             os.replace(tmp, self.path)
         except OSError:
             tmp.unlink(missing_ok=True)
@@ -2692,7 +2934,7 @@ def _on_sigterm(signum, frame) -> None:
 
 
 def main() -> int:
-    global REGISTRY_TIMEOUT
+    global REGISTRY_TIMEOUT, ICONS
     if sys.version_info < (3, 9):
         say_error(f"{__title__} needs Python 3.9 or newer (this is {sys.version.split()[0]})")
         return 2
@@ -2775,9 +3017,13 @@ def main() -> int:
         user_warning = setup_docker_user(cfg.docker_user)
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
+        if not args.dry_run:
+            migrate_layout(LAYOUT, CONFIG_FILE.name, SCRIPT_NAME)
         try:
             created = not CONFIG_FILE.is_file()
-            added, removed, changed = sync_config(CONFIG_FILE, write=not args.dry_run)
+            added, removed, changed = sync_config(
+                CONFIG_FILE, write=not args.dry_run,
+                before_change=lambda key, old, new: relocate_default_data(key, old, new, CONFIG_FILE.parent))
         except OSError as e:
             say(yellow(f"{SYM['warn']} Config not updated: {e.strerror or e}"))
         else:
@@ -2793,6 +3039,8 @@ def main() -> int:
                           f"{old or '(empty)'} {SYM['arrow']} {new or '(empty)'}"))
             if (added or removed or changed) and not args.dry_run:
                 cfg = load_config(CONFIG_FILE)
+        if cfg.icons and not args.dry_run:
+            ICONS = IconStore(LAYOUT.cache / "icons", cfg.status_file.parent, cfg.icon_index_days)
         if args.uninstall:
             return run_uninstall(cfg, args.dry_run)
         if args.install:

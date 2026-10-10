@@ -85,7 +85,8 @@ SCRIPT="$DIR/TugBoat.py"
 CONF="$DIR/TugBoat.conf"
 
 if [ -f "$SCRIPT" ]; then
-    cp -p "$SCRIPT" "$DIR/.TugBoat.py.bak"
+    mkdir -p "$DIR/TugBoat/state"
+    cp -p "$SCRIPT" "$DIR/TugBoat/state/script-previous.bak"
 fi
 cp "$TMP/TugBoat.py" "$SCRIPT.new"
 chmod 755 "$SCRIPT.new"
@@ -107,12 +108,6 @@ if [ -f "$CONF" ]; then
 else
     fetch "$RAW/TugBoat.conf" "$CONF" || fail "could not download TugBoat.conf"
     chmod 644 "$CONF"
-    if [ -n "${TUGBOAT_CONTAINER_PATH:-}" ]; then
-        set_conf container_path "$TUGBOAT_CONTAINER_PATH"
-        set_conf backup_path "$TUGBOAT_CONTAINER_PATH/.backup/\$STACK-NAME"
-    fi
-    CONTAINERS="$(awk -F': *' '$1 == "container_path" { print $2 }' "$CONF" | tr -d '\r')"
-    set_conf status_file "$CONTAINERS/tugboat.json"
     if [ -z "$DOCKER_USER" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
         DOCKER_USER="$SUDO_USER"
     fi
