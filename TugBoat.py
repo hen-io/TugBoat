@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -60,6 +60,40 @@ CONFIG_DEFAULTS = {
     "update_check_interval": "60",
     "auto_update": "true",
 }
+CONFIG_HELP = {
+    "stacks_directory": "Folders that hold your stacks, one '- \"path\"' line each (<folder>/<stack>/compose.yaml)",
+    "require_root": "Restart with sudo when not run as root",
+    "status_file": "Where the status JSON is written",
+    "ignore_folders": "Stack folder names to leave alone, one '- \"name\"' line each",
+    "backup": "Back up a stack folder before every update",
+    "backup_path": "Where backups go ($STACK-NAME becomes the stack name)",
+    "backup_retention": "Backups to keep per stack (0 = keep all)",
+    "backup_large_mb": "A backup bigger than this many MB counts as large (0 = off)",
+    "backup_large_retention": "Backups to keep for a stack whose newest backup is large",
+    "docker_user": "Run docker commands as this user (empty = the user running TugBoat)",
+    "health_wait": "Seconds to wait for containers to become healthy after a start",
+    "image_check": "Check the registries for new image versions during the health check",
+    "image_check_interval": "Minutes between registry checks per stack",
+    "registry_timeout": "Seconds to wait for a registry to answer",
+    "icons": "Find a logo for each stack and image (saved in TugBoat/cache/icons)",
+    "icon_index_days": "Days between downloads of the icon index",
+    "manage_cron": "Keep the health check cron job in line with this config",
+    "healthcheck_interval": "Minutes between health checks (1-59, or whole hours: 60, 120 ...)",
+    "install_dependencies": "Install missing Docker, Compose plugin and cron (apt, dnf, pacman)",
+    "command_timeout": "Seconds before a stop, start or update command is stopped (0 = no limit)",
+    "update_check": "Look for a new TugBoat release",
+    "update_check_interval": "Minutes between checks for a new TugBoat release",
+    "auto_update": "Install new TugBoat releases automatically",
+}
+CONFIG_GROUPS = (
+    ("stacks_directory", "require_root", "status_file", "ignore_folders"),
+    ("backup", "backup_path", "backup_retention", "backup_large_mb", "backup_large_retention"),
+    ("docker_user", "health_wait", "command_timeout"),
+    ("image_check", "image_check_interval", "registry_timeout"),
+    ("icons", "icon_index_days"),
+    ("manage_cron", "healthcheck_interval", "install_dependencies"),
+    ("update_check", "update_check_interval", "auto_update"),
+)
 PREVIOUS_DEFAULTS = {
     "status_file": ["{container_path}/tugboat.json", "./tugboat.json"],
     "backup_path": ["{container_path}/.backup/$STACK-NAME"],
@@ -73,6 +107,7 @@ OBSOLETE_CONFIG_KEYS = ("docker_stack_up_cmd", "docker_stack_down_cmd", "docker_
 
 PINNED_CONFIG_KEYS = ("stacks_directory",)
 RENAMED_CONFIG_KEYS = {"container_path": "stacks_directory"}
+LIST_CONFIG_KEYS = ("stacks_directory", "ignore_folders")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -674,27 +709,60 @@ def _strip_comment(value: str) -> str:
 CONFIG_KEY_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*:")
 
 
-def parse_config_text(text: str, name: str) -> dict[str, str]:
-    raw: dict[str, str] = {}
+LIST_ITEM_RE = re.compile(r"^\s*-(?:\s+(.*))?$")
+
+
+def unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def parse_config_text(text: str, name: str) -> dict[str, str | list[str]]:
+    raw: dict[str, str | list[str]] = {}
+    current = ""
     for lineno, line in enumerate(text.lstrip("\ufeff").splitlines(), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
+        item = LIST_ITEM_RE.match(line)
+        if item:
+            if current not in LIST_CONFIG_KEYS:
+                raise ValueError(f"{name} line {lineno}: '- value' lines only work under "
+                                 f"{', '.join(LIST_CONFIG_KEYS)}")
+            value = unquote(_strip_comment(item.group(1) or ""))
+            if value:
+                raw[current].append(value)
+            continue
         if ":" not in stripped:
             raise ValueError(f"{name} line {lineno}: expected 'key: value'")
         key, value = stripped.split(":", 1)
-        value = _strip_comment(value).strip().strip('"').strip("'")
-        raw[key.strip().lower()] = value
+        current = key.strip().lower()
+        value = unquote(_strip_comment(value))
+        raw[current] = split_list(value) if current in LIST_CONFIG_KEYS else value
     return raw
 
 
-def split_dirs(value: str) -> list[str]:
-    return [part.strip() for part in value.split(",") if part.strip()]
+def split_list(value: str) -> list[str]:
+    return [unquote(part) for part in value.split(",") if part.strip()]
 
 
-def first_stacks_dir(raw: dict[str, str]) -> str:
-    value = raw.get("stacks_directory") or raw.get("container_path") or CONFIG_DEFAULTS["stacks_directory"]
-    return (split_dirs(value) or [CONFIG_DEFAULTS["stacks_directory"]])[0]
+def config_list(raw: dict, key: str) -> list[str]:
+    value = raw.get(key)
+    if value is None:
+        value = CONFIG_DEFAULTS[key]
+    return list(value) if isinstance(value, list) else split_list(value)
+
+
+def render_list(key: str, items: list[str], newline: str) -> str:
+    return f"{key}:{newline}" + "".join(f'  - "{item}"{newline}' for item in items)
+
+
+def first_stacks_dir(raw: dict) -> str:
+    key = "stacks_directory" if "stacks_directory" in raw or "container_path" not in raw else "container_path"
+    items = config_list(raw, key) if key == "stacks_directory" else split_list(str(raw[key]))
+    return (items or [CONFIG_DEFAULTS["stacks_directory"]])[0]
 
 
 def config_default(key: str, raw: dict[str, str]) -> str:
@@ -733,11 +801,22 @@ def replace_config_value(line: str, new: str) -> str:
     return f"{bom}{head}: {new}".rstrip() + (f"  {comment}" if comment else "") + ending
 
 
+def config_entry(key: str, value: str, newline: str) -> str:
+    body = render_list(key, split_list(value), newline) if key in LIST_CONFIG_KEYS else f"{key}: {value}".rstrip() + newline
+    return f"# {CONFIG_HELP[key]}{newline}" + body
+
+
+def render_default_config(newline: str = "\r\n") -> str:
+    return newline.join("".join(config_entry(k, config_default(k, {}), newline) for k in group)
+                        for group in CONFIG_GROUPS)
+
+
 def sync_config(path: Path, write: bool = True,
                 before_change: Callable[[str, str, str], bool] | None = None,
                 ) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
     exists = path.is_file()
-    text = path.read_bytes().decode("utf-8") if exists else ""
+    text = path.read_bytes().decode("utf-8") if exists else render_default_config()
+    created = not exists
     raw = parse_config_text(text, path.name)
     newline = "\r\n" if "\r\n" in text else "\n"
     state = load_defaults_state(path)
@@ -746,6 +825,7 @@ def sync_config(path: Path, write: bool = True,
     removed: list[str] = []
     changed: list[tuple[str, str, str]] = []
     kept: list[str] = []
+    described = False
     for line in text.splitlines(keepends=True):
         match = None if line.lstrip("\ufeff").lstrip().startswith("#") else CONFIG_KEY_RE.match(line.lstrip("\ufeff"))
         key = match.group(1).lower() if match else ""
@@ -762,7 +842,14 @@ def sync_config(path: Path, write: bool = True,
             continue
         if key:
             present.add(key)
-        if key in CONFIG_DEFAULTS and key in raw and key not in PINNED_CONFIG_KEYS:
+        if key in CONFIG_HELP and not (kept and kept[-1].lstrip("\ufeff").lstrip().startswith("#")):
+            kept.append(f"# {CONFIG_HELP[key]}{newline}")
+            described = True
+        if key in LIST_CONFIG_KEYS and line.split(":", 1)[1].split("#")[0].strip():
+            line = render_list(key, split_list(_strip_comment(line.split(":", 1)[1])), newline)
+            described = True
+        if (key in CONFIG_DEFAULTS and key in raw and key not in PINNED_CONFIG_KEYS
+                and key not in LIST_CONFIG_KEYS):
             if state is None:
                 olds = PREVIOUS_DEFAULTS.get(key, [])
             else:
@@ -775,14 +862,14 @@ def sync_config(path: Path, write: bool = True,
                 line = replace_config_value(line, new_value)
         kept.append(line)
     missing = [key for key in CONFIG_DEFAULTS if key not in present]
-    if not missing and not removed and not changed:
+    if not (missing or removed or changed or described or created):
         if write and state != CONFIG_DEFAULTS:
             save_defaults_state(path)
         return [], [], []
     out = "".join(kept)
     if missing and out and not out.endswith(("\n", "\r")):
         out += newline
-    out += "".join(f"{key}: {config_default(key, raw)}".rstrip() + newline for key in missing)
+    out += "".join(config_entry(key, config_default(key, raw), newline) for key in missing)
     if write:
         tmp = path.with_name(f".{path.name}.new")
         try:
@@ -803,7 +890,7 @@ def sync_config(path: Path, write: bool = True,
             tmp.unlink(missing_ok=True)
             raise
         save_defaults_state(path)
-    return missing, removed, changed
+    return (list(CONFIG_DEFAULTS) if created else missing), removed, changed
 
 
 def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
@@ -811,23 +898,24 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
 
     def get(key: str) -> str:
         value = raw.get(key)
-        if key == "stacks_directory" and value is None:
-            value = raw.get("container_path")
-        if value is None or (not value and key == "stacks_directory"):
+        if value is None:
             return config_default(key, raw)
         return value
+
+    stacks = config_list(raw, "stacks_directory") if "stacks_directory" in raw else (
+        split_list(str(raw["container_path"])) if "container_path" in raw else config_list(raw, "stacks_directory"))
 
     def resolve(value: str | Path) -> Path:
         return base / Path(value).expanduser()
 
     return Config(
-        stacks_dirs=[resolve(d) for d in split_dirs(get("stacks_directory"))] or [base],
+        stacks_dirs=[resolve(d) for d in stacks] or [base],
         backup=_parse_bool(get("backup"), "backup"),
         backup_path=str(resolve(get("backup_path") or config_default("backup_path", raw))),
         backup_retention=_parse_int(get("backup_retention"), "backup_retention"),
         backup_large_mb=_parse_int(get("backup_large_mb"), "backup_large_mb"),
         backup_large_retention=_parse_int(get("backup_large_retention"), "backup_large_retention"),
-        ignore_folders={n.strip().strip("/") for n in get("ignore_folders").split(",") if n.strip()},
+        ignore_folders={n.strip().strip("/") for n in config_list(raw, "ignore_folders") if n.strip()},
         require_root=_parse_bool(get("require_root"), "require_root"),
         docker_user=get("docker_user").strip(),
         update_check=_parse_bool(get("update_check"), "update_check"),

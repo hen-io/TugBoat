@@ -64,10 +64,17 @@ else
 fi
 
 set_conf() {
-    awk -v key="$1" -v value="$2" '
-        $0 ~ "^" key ":" { print key ": " value; done = 1; next }
+    case "$1" in
+        stacks_directory|ignore_folders) line="$1:
+  - \"$2\"" ;;
+        *) line="$1: $2" ;;
+    esac
+    awk -v key="$1" -v line="$line" '
+        skip && /^[ \t]*-/ { next }
+        { skip = 0 }
+        $0 ~ "^" key ":" { print line; done = 1; skip = 1; next }
         { print }
-        END { if (!done) print key ": " value }
+        END { if (!done) print line }
     ' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
 }
 
