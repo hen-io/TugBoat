@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.4.0"
+__version__ = "0.4.2"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -43,7 +43,6 @@ CONFIG_FILE = SCRIPT_DIR / "TugBoat.conf"
 COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 TIMESTAMP_FORMAT = "%d_%m_%y_%H_%M_%S"
 STACK_PLACEHOLDER = "$STACK-NAME"
-START_CMD = "docker compose up -d --pull missing"
 ERROR_TAIL_LINES = 20
 
 
@@ -491,9 +490,6 @@ class Config:
     backup_path: str
     backup_retention: int
     up_cmd: str
-    down_cmd: str
-    start_cmd: str
-    restore_cmd: str
     ignore_folders: set[str]
     require_root: bool
     status_file: Path
@@ -553,7 +549,7 @@ def load_config(path: Path) -> Config:
         value = _strip_comment(value).strip().strip('"').strip("'")
         raw[key.strip().lower()] = value
 
-    required = ("container_path", "docker_stack_up_cmd", "docker_stack_down_cmd")
+    required = ("container_path", "docker_stack_up_cmd")
     missing = [k for k in required if not raw.get(k)]
     if missing:
         raise ValueError(f"Missing required config value(s): {', '.join(missing)}")
@@ -568,9 +564,6 @@ def load_config(path: Path) -> Config:
         backup_path=str(resolve(raw.get("backup_path") or container_path / ".backup" / STACK_PLACEHOLDER)),
         backup_retention=_parse_int(raw.get("backup_retention", "10"), "backup_retention"),
         up_cmd=raw["docker_stack_up_cmd"],
-        down_cmd=raw["docker_stack_down_cmd"],
-        start_cmd=raw.get("docker_stack_start_cmd") or START_CMD,
-        restore_cmd=raw.get("docker_stack_restore_cmd") or raw.get("docker_stack_start_cmd") or START_CMD,
         ignore_folders={n.strip().strip("/") for n in raw.get("ignore_folders", "").split(",")
                         if n.strip()},
         require_root=_parse_bool(raw.get("require_root", "true"), "require_root"),
@@ -1931,6 +1924,12 @@ def _fail(res: StackResult, step: str, out: StepOutcome, status: str) -> StackRe
 
 
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+COMPOSE_STOP = "docker compose stop"
+COMPOSE_START = "docker compose start"
+COMPOSE_CREATE = "docker compose up -d --pull never"
+OLD_CONTAINERS_DRY = "would remove containers from outside the stack that use the same names"
+START_DRY = (f"would run: {COMPOSE_START}, and create missing containers with "
+             f"{COMPOSE_CREATE} --force-recreate --no-deps <service>")
 
 
 def name_conflicts(stack: Path) -> tuple[list[dict], list[str]]:
@@ -1964,7 +1963,7 @@ def name_conflicts(stack: Path) -> tuple[list[dict], list[str]]:
         running = bool((c.get("State") or {}).get("Running"))
         if owner and owner != project:
             blocked.append(f"{name} belongs to the compose project '{owner}'")
-        elif not (owner and running):
+        elif not owner:
             remove.append({"name": name, "running": running})
     return remove, blocked
 
@@ -1996,23 +1995,58 @@ def clear_old_containers(stack: Path, ui: Runner) -> StepOutcome | None:
     return ui.step("Old containers", clear_work(remove, blocked))
 
 
-OLD_CONTAINERS_DRY = "would remove existing containers that use the same names"
+def compose_services(stack: Path) -> list[str] | None:
+    rc, out, _ = docker(["compose", "config", "--format", "json"], cwd=stack)
+    try:
+        services = json.loads(out).get("services") if rc == 0 else None
+    except (ValueError, AttributeError):
+        services = None
+    return sorted(services) if isinstance(services, dict) else None
+
+
+def create_cmd(services: list[str]) -> str:
+    if not services:
+        return COMPOSE_CREATE
+    return f"{COMPOSE_CREATE} --force-recreate --no-deps " + " ".join(shlex.quote(name) for name in services)
+
+
+def start_containers(stack: Path, cfg: Config, ui: Runner) -> tuple[str, StepOutcome] | None:
+    old = clear_old_containers(stack, ui)
+    if old and not old.ok:
+        return "Old containers", old
+    containers = compose_ps(stack)[0] or []
+    declared = compose_services(stack)
+    existing = {c["service"] for c in containers}
+    redo = [name for name in declared if name not in existing] if declared is not None else []
+    started: StepOutcome | None = None
+    if containers:
+        started = ui.step("Start", command_work(COMPOSE_START, stack), timeout=cfg.command_timeout)
+        if not started.ok:
+            after = compose_ps(stack)[0] or []
+            redo = sorted(set(redo) | {c["service"] for c in after if c["service"] and c["state"] != "running"})
+    elif declared is None:
+        out = ui.step("Create", command_work(create_cmd([]), stack), timeout=cfg.command_timeout)
+        return None if out.ok else ("Create", out)
+    if redo:
+        out = ui.step("Create", command_work(create_cmd(redo), stack), timeout=cfg.command_timeout)
+        if not out.ok:
+            return "Create", out
+    elif started is not None and not started.ok:
+        return "Start", started
+    return None
 
 
 def start_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     res = StackResult(stack.name)
     if ui.dry_run:
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
-        ui.dry("Start", f"would run: {cfg.start_cmd}")
+        ui.dry("Start", START_DRY)
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
         res.status = "would start"
         return res
-    old = clear_old_containers(stack, ui)
-    if old and not old.ok:
-        return _fail(res, "Old containers", old, "start failed")
-    out = ui.step("Start", command_work(cfg.start_cmd, stack), timeout=cfg.command_timeout)
-    if not out.ok:
-        return _fail(res, "Start", out, "start failed")
+    failed = start_containers(stack, cfg, ui)
+    if failed:
+        return _fail(res, failed[0], failed[1], "start failed")
     out = ui.step("Health check", health_work(stack, cfg, res))
     if out.warn:
         res.warnings.append(Issue(res.name, "Health check", out.note, out.details, out.output))
@@ -2025,10 +2059,10 @@ def start_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
 def stop_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     res = StackResult(stack.name)
     if ui.dry_run:
-        ui.dry("Stop", f"would run: {cfg.down_cmd}")
+        ui.dry("Stop", f"would run: {COMPOSE_STOP}")
         res.status = "would stop"
         return res
-    out = ui.step("Stop", command_work(cfg.down_cmd, stack), timeout=cfg.command_timeout)
+    out = ui.step("Stop", command_work(COMPOSE_STOP, stack), timeout=cfg.command_timeout)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed")
     res.status = "stopped"
@@ -2038,21 +2072,18 @@ def stop_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
 def restart_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     res = StackResult(stack.name)
     if ui.dry_run:
-        ui.dry("Stop", f"would run: {cfg.down_cmd}")
+        ui.dry("Stop", f"would run: {COMPOSE_STOP}")
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
-        ui.dry("Start", f"would run: {cfg.start_cmd}")
+        ui.dry("Start", START_DRY)
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
         res.status = "would restart"
         return res
-    out = ui.step("Stop", command_work(cfg.down_cmd, stack), timeout=cfg.command_timeout)
+    out = ui.step("Stop", command_work(COMPOSE_STOP, stack), timeout=cfg.command_timeout)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
-    old = clear_old_containers(stack, ui)
-    if old and not old.ok:
-        return _fail(res, "Old containers", old, "start failed - stack is DOWN")
-    out = ui.step("Start", command_work(cfg.start_cmd, stack), timeout=cfg.command_timeout)
-    if not out.ok:
-        return _fail(res, "Start", out, "start failed - stack is DOWN")
+    failed = start_containers(stack, cfg, ui)
+    if failed:
+        return _fail(res, failed[0], failed[1], "start failed - stack is stopped")
     out = ui.step("Health check", health_work(stack, cfg, res))
     if out.warn:
         res.warnings.append(Issue(res.name, "Health check", out.note, out.details, out.output))
@@ -2063,12 +2094,11 @@ def restart_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
 
 
 def _restart_old(stack: Path, cfg: Config, ui: Runner, res: StackResult, what: str) -> StackResult:
-    clear_old_containers(stack, ui)
-    restart = ui.step("Restart old version", command_work(cfg.restore_cmd, stack), timeout=cfg.command_timeout)
-    if restart.ok:
+    failed = start_containers(stack, cfg, ui)
+    if failed is None:
         res.status = f"{what} failed, old version restarted"
     else:
-        _fail(res, "Restart old version", restart, f"{what} AND restart failed - stack is DOWN")
+        _fail(res, "Restart old version", failed[1], f"{what} AND restart failed - stack is DOWN")
     return res
 
 
@@ -2083,7 +2113,7 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         return res
 
     if ui.dry_run:
-        ui.dry("Stop", f"would run: {cfg.down_cmd}")
+        ui.dry("Stop", f"would run: {COMPOSE_STOP}")
         if do_backup:
             ui.dry("Backup", f"would copy to {cfg.backup_root(stack.name)}/<timestamp>")
             ui.dry("Prune backups", f"would keep newest {cfg.backup_retention}")
@@ -2095,7 +2125,7 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         res.status = "would update"
         return res
 
-    out = ui.step("Stop", command_work(cfg.down_cmd, stack), timeout=cfg.command_timeout)
+    out = ui.step("Stop", command_work(COMPOSE_STOP, stack), timeout=cfg.command_timeout)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
 
@@ -2202,8 +2232,8 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--update", nargs="*", metavar="STACK",
                       help="stop -> backup -> pull -> start -> health check")
-    mode.add_argument("--start", nargs="*", metavar="STACK", help="start (docker_stack_start_cmd)")
-    mode.add_argument("--stop", nargs="*", metavar="STACK", help="stop (docker_stack_down_cmd)")
+    mode.add_argument("--start", nargs="*", metavar="STACK", help="start the stack's containers, creating missing ones (never pulls)")
+    mode.add_argument("--stop", nargs="*", metavar="STACK", help="stop the stack's containers (they are kept)")
     mode.add_argument("--restart", nargs="*", metavar="STACK",
                       help="stop -> start -> health check, without pulling new images")
     mode.add_argument("--healthcheck", nargs="*", metavar="STACK",
