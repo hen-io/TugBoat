@@ -18,7 +18,7 @@ Requirements:
 
 The installer installs anything that is missing (Docker, Compose plugin, cron, Python) on apt, dnf and pacman systems, and TugBoat installs missing Docker or cron itself when it starts. Set `TUGBOAT_INSTALL_DEPS=0` for the installer, or `install_dependencies: false` in `TugBoat.conf`, to turn that off.
 
-To set the stacks folder (default `/container-data`) and the docker user (default: the user who ran `sudo`) yourself:
+TugBoat and its `TugBoat.conf` are installed in the stacks folder. To set that folder (default `/container-data`) and the docker user (default: the user who ran `sudo`) yourself:
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/hen-io/TugBoat/main/install.sh | sudo env TUGBOAT_CONTAINER_PATH=/path/to/stacks TUGBOAT_DOCKER_USER=dockeruser sh

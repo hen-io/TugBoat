@@ -2,7 +2,7 @@
 set -eu
 
 RAW="${TUGBOAT_RAW:-https://raw.githubusercontent.com/hen-io/TugBoat/main}"
-DIR="${TUGBOAT_DIR:-/opt/TugBoat}"
+DIR="${TUGBOAT_DIR:-${TUGBOAT_CONTAINER_PATH:-/container-data}}"
 LINK="${TUGBOAT_LINK:-/usr/local/bin/tugboat}"
 
 fail() {
