@@ -1,0 +1,2 @@
+# TugBoat - healthcheck
+{schedule} PATH={path} {python} {script} --healthcheck >/dev/null 2>&1

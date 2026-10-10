@@ -82,7 +82,12 @@ python3 "$TMP/TugBoat.py" --version >/dev/null 2>&1 || fail "the downloaded TugB
 
 mkdir -p "$DIR"
 SCRIPT="$DIR/TugBoat.py"
-CONF="$DIR/TugBoat.conf"
+CONF="$DIR/TugBoat/TugBoat.conf"
+mkdir -p "$DIR/TugBoat"
+if [ ! -f "$CONF" ] && [ -f "$DIR/TugBoat.conf" ]; then
+    mv "$DIR/TugBoat.conf" "$CONF"
+    say "Moved your config to $CONF"
+fi
 
 if [ -f "$SCRIPT" ]; then
     mkdir -p "$DIR/TugBoat/state"
@@ -98,15 +103,15 @@ if [ -f "$CONF" ]; then
         set_conf install_dependencies false
     fi
     if [ -n "${TUGBOAT_CONTAINER_PATH:-}" ]; then
-        set_conf container_path "$TUGBOAT_CONTAINER_PATH"
-        say "container_path set to $TUGBOAT_CONTAINER_PATH"
+        set_conf stacks_directory "$TUGBOAT_CONTAINER_PATH"
+        say "stacks_directory set to $TUGBOAT_CONTAINER_PATH"
     fi
     if [ -n "$DOCKER_USER" ]; then
         set_conf docker_user "$DOCKER_USER"
         say "docker_user set to $DOCKER_USER"
     fi
 else
-    fetch "$RAW/TugBoat.conf" "$CONF" || fail "could not download TugBoat.conf"
+    fetch "$RAW/TugBoat/TugBoat.conf" "$CONF" || fail "could not download TugBoat.conf"
     chmod 644 "$CONF"
     if [ -z "$DOCKER_USER" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
         DOCKER_USER="$SUDO_USER"
@@ -121,6 +126,10 @@ else
     say "Created $CONF"
 fi
 
+mkdir -p "$DIR/TugBoat/bin"
+fetch "$RAW/TugBoat/bin/cron.entry" "$TMP/cron.entry" && [ -s "$TMP/cron.entry" ] \
+    && cp "$TMP/cron.entry" "$DIR/TugBoat/bin/cron.entry"
+
 if [ -d "$(dirname "$LINK")" ]; then
     ln -sf "$SCRIPT" "$LINK"
 fi
@@ -133,6 +142,6 @@ if python3 "$SCRIPT" --install; then
 else
     say ""
     say "TugBoat is installed, but the cron job was not added."
-    say "Edit $CONF (container_path must exist), then run:  sudo python3 $SCRIPT --install"
+    say "Edit $CONF (stacks_directory must exist), then run:  sudo python3 $SCRIPT --install"
     exit 1
 fi

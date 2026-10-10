@@ -31,12 +31,12 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
 CONFIG_DEFAULTS = {
-    "container_path": ".",
+    "stacks_directory": ".",
     "require_root": "true",
     "status_file": "./TugBoat/tugboat.json",
     "ignore_folders": "",
@@ -71,10 +71,10 @@ PREVIOUS_DEFAULTS = {
 OBSOLETE_CONFIG_KEYS = ("docker_stack_up_cmd", "docker_stack_down_cmd", "docker_stack_start_cmd",
                         "docker_stack_restore_cmd")
 
-PINNED_CONFIG_KEYS = ("container_path",)
+PINNED_CONFIG_KEYS = ("stacks_directory",)
+RENAMED_CONFIG_KEYS = {"container_path": "stacks_directory"}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = SCRIPT_DIR / "TugBoat.conf"
 
 
 class Layout:
@@ -84,9 +84,14 @@ class Layout:
         self.data = root / "TugBoat"
         self.state = self.data / "state"
         self.cache = self.data / "cache"
+        self.bin = self.data / "bin"
+        self.cron_entry = self.bin / "cron.entry"
+        self.config = self.data / "TugBoat.conf"
+        self.old_config = root / "TugBoat.conf"
 
     def old_files(self, conf: str, script: str) -> list[tuple[Path, Path]]:
         pairs = [
+            (self.old_config, self.config),
             (self.root / f".{conf}.bak", self.state / "config.bak"),
             (self.root / f".{conf}.defaults", self.state / "config.defaults"),
             (self.root / ".TugBoat.crontab.bak", self.state / "crontab.bak"),
@@ -100,6 +105,11 @@ class Layout:
 
 
 LAYOUT = Layout(SCRIPT_DIR)
+CONFIG_FILE = LAYOUT.config
+
+
+def config_source() -> Path:
+    return CONFIG_FILE if CONFIG_FILE.is_file() or not LAYOUT.old_config.is_file() else LAYOUT.old_config
 
 
 def ensure_parent(path: Path) -> Path:
@@ -504,9 +514,17 @@ def install_release(rel: dict, dry_run: bool) -> bool:
         say_error(f"Could not replace {script}: {e}")
         return False
     say(f"  {green(SYM['ok'])} Installed {bold(rel['tag'])}  {dim(f'(old version kept as {backup.name})')}")
+    try:
+        entry = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/{CRON_ENTRY_URL}", 10).decode("utf-8-sig")
+        if any(l.strip() and not l.strip().startswith("#") for l in entry.splitlines()):
+            tmp_entry = ensure_parent(LAYOUT.cron_entry).with_name("cron.entry.new")
+            tmp_entry.write_text(entry, encoding="utf-8")
+            os.replace(tmp_entry, LAYOUT.cron_entry)
+    except (URLError, OSError, HTTPException, UnicodeDecodeError):
+        pass
 
     try:
-        example = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/TugBoat.conf", 10).decode("utf-8")
+        example = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/TugBoat/TugBoat.conf", 10).decode("utf-8")
         local = (set(_conf_keys(CONFIG_FILE.read_text(encoding="utf-8")))
                  if CONFIG_FILE.is_file() else set())
         new_keys = [k for k in _conf_keys(example) if k not in local]
@@ -597,7 +615,7 @@ def startup_update_check(cfg: "Config", dry_run: bool, db: "StatusDB | None") ->
 
 @dataclass
 class Config:
-    container_path: Path
+    stacks_dirs: list[Path]
     backup: bool
     backup_path: str
     backup_retention: int
@@ -670,13 +688,21 @@ def parse_config_text(text: str, name: str) -> dict[str, str]:
     return raw
 
 
+def split_dirs(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def first_stacks_dir(raw: dict[str, str]) -> str:
+    value = raw.get("stacks_directory") or raw.get("container_path") or CONFIG_DEFAULTS["stacks_directory"]
+    return (split_dirs(value) or [CONFIG_DEFAULTS["stacks_directory"]])[0]
+
+
 def config_default(key: str, raw: dict[str, str]) -> str:
-    container = raw.get("container_path") or CONFIG_DEFAULTS["container_path"]
-    return CONFIG_DEFAULTS[key].replace("{container_path}", container)
+    return CONFIG_DEFAULTS[key].replace("{container_path}", first_stacks_dir(raw))
 
 
 def defaults_state_path(path: Path) -> Path:
-    return Layout(path.parent).state / "config.defaults"
+    return LAYOUT.state / "config.defaults"
 
 
 def load_defaults_state(path: Path) -> dict[str, str] | None:
@@ -715,7 +741,7 @@ def sync_config(path: Path, write: bool = True,
     raw = parse_config_text(text, path.name)
     newline = "\r\n" if "\r\n" in text else "\n"
     state = load_defaults_state(path)
-    container = raw.get("container_path") or CONFIG_DEFAULTS["container_path"]
+    container = first_stacks_dir(raw)
     present: set[str] = set()
     removed: list[str] = []
     changed: list[tuple[str, str, str]] = []
@@ -723,6 +749,14 @@ def sync_config(path: Path, write: bool = True,
     for line in text.splitlines(keepends=True):
         match = None if line.lstrip("\ufeff").lstrip().startswith("#") else CONFIG_KEY_RE.match(line.lstrip("\ufeff"))
         key = match.group(1).lower() if match else ""
+        if key in RENAMED_CONFIG_KEYS:
+            new_key = RENAMED_CONFIG_KEYS[key]
+            if new_key in raw or new_key in present:
+                removed.append(key)
+                continue
+            changed.append((key, key, new_key))
+            line = line.replace(match.group(1), new_key, 1)
+            key = new_key
         if key in OBSOLETE_CONFIG_KEYS:
             removed.append(key)
             continue
@@ -753,8 +787,8 @@ def sync_config(path: Path, write: bool = True,
         tmp = path.with_name(f".{path.name}.new")
         try:
             if exists:
-                ensure_parent(Layout(path.parent).state / "config.bak").write_bytes(text.encode("utf-8"))
-            tmp.write_bytes(out.encode("utf-8"))
+                ensure_parent(LAYOUT.state / "config.bak").write_bytes(text.encode("utf-8"))
+            ensure_parent(tmp).write_bytes(out.encode("utf-8"))
             if exists:
                 st = path.stat()
                 os.chmod(tmp, st.st_mode)
@@ -772,20 +806,22 @@ def sync_config(path: Path, write: bool = True,
     return missing, removed, changed
 
 
-def load_config(path: Path) -> Config:
+def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
     raw = parse_config_text(path.read_bytes().decode("utf-8"), path.name) if path.is_file() else {}
 
     def get(key: str) -> str:
         value = raw.get(key)
-        if value is None or (not value and key == "container_path"):
+        if key == "stacks_directory" and value is None:
+            value = raw.get("container_path")
+        if value is None or (not value and key == "stacks_directory"):
             return config_default(key, raw)
         return value
 
     def resolve(value: str | Path) -> Path:
-        return path.parent / Path(value).expanduser()
+        return base / Path(value).expanduser()
 
     return Config(
-        container_path=resolve(get("container_path")),
+        stacks_dirs=[resolve(d) for d in split_dirs(get("stacks_directory"))] or [base],
         backup=_parse_bool(get("backup"), "backup"),
         backup_path=str(resolve(get("backup_path") or config_default("backup_path", raw))),
         backup_retention=_parse_int(get("backup_retention"), "backup_retention"),
@@ -1031,10 +1067,42 @@ def fmt_interval(minutes: int) -> str:
     return "every minute" if minutes == 1 else f"every {minutes} minutes"
 
 
+CRON_TEMPLATE = "{schedule} PATH={path} {python} {script} --healthcheck >/dev/null 2>&1\n"
+CRON_ENTRY_URL = "TugBoat/bin/cron.entry"
+CRON_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+
 def cron_command() -> str:
     script = Path(__file__).resolve()
     return (f"PATH={CRON_PATH} {shlex.quote(sys.executable)} {shlex.quote(str(script))} "
             "--healthcheck >/dev/null 2>&1")
+
+
+def cron_template() -> str:
+    try:
+        text = LAYOUT.cron_entry.read_text(encoding="utf-8-sig")
+    except OSError:
+        try:
+            ensure_parent(LAYOUT.cron_entry).write_text(CRON_TEMPLATE, encoding="utf-8")
+        except OSError:
+            pass
+        text = CRON_TEMPLATE
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+    if not lines:
+        raise ValueError(f"{LAYOUT.cron_entry} has no cron line")
+    return lines[0]
+
+
+def cron_line(cfg: Config) -> str:
+    values = {key: ",".join(map(str, value)) if isinstance(value, (list, set)) else str(value)
+              for key, value in vars(cfg).items()}
+    values.update(schedule=cron_schedule(cfg.healthcheck_interval), path=CRON_PATH,
+                  python=shlex.quote(sys.executable), script=shlex.quote(str(Path(__file__).resolve())),
+                  script_dir=shlex.quote(str(SCRIPT_DIR)))
+    unknown = sorted({m for m in CRON_PLACEHOLDER_RE.findall(cron_template()) if m not in values})
+    if unknown:
+        raise ValueError(f"unknown placeholder(s) in {LAYOUT.cron_entry.name}: " + ", ".join(f"{{{u}}}" for u in unknown))
+    return CRON_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], cron_template())
 
 
 CRON_ENV_RE = re.compile(r"^[A-Za-z_]\w*=[\w.,:/@%+=-]*$")
@@ -1111,8 +1179,8 @@ def cron_lines(text: str) -> list[str]:
 
 def plan_cron(current: str, line: str | None) -> tuple[str, str]:
     if line is not None and not is_tugboat_cron(line):
-        raise RuntimeError("the cron line TugBoat would write is not recognised as its own - "
-                           "nothing was changed")
+        raise RuntimeError(f"the line in {LAYOUT.cron_entry} must run {SCRIPT_NAME} --healthcheck "
+                           "without extra commands - nothing was changed")
     lines = cron_lines(current)
     others = [text for text in lines if not is_tugboat_cron(text)]
     hits = [i for i, text in enumerate(lines) if is_tugboat_cron(text)]
@@ -1131,14 +1199,14 @@ def plan_cron(current: str, line: str | None) -> tuple[str, str]:
 
 def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
     try:
-        schedule = cron_schedule(cfg.healthcheck_interval)
+        line = cron_line(cfg)
     except ValueError as e:
         return "error", str(e)
     if shutil.which("crontab") is None:
         return "error", "crontab not found - install cron first (Debian/Ubuntu: apt install cron)"
     try:
         current = read_crontab()
-        updated, old = plan_cron(current, f"{schedule} {cron_command()}")
+        updated, old = plan_cron(current, line)
         if updated.rstrip("\n") == current.rstrip("\n"):
             return "same", ""
         if not dry_run:
@@ -1168,8 +1236,9 @@ def describe_cron(cfg: Config, state: str, old: str, dry_run: bool = False) -> s
 
 
 def run_install(cfg: Config, dry_run: bool) -> int:
-    if not cfg.container_path.is_dir():
-        say_error(f"container_path does not exist: {cfg.container_path} - "
+    missing = [d for d in cfg.stacks_dirs if not d.is_dir()]
+    if missing:
+        say_error(f"stacks_directory does not exist: {', '.join(map(str, missing))} - "
                   f"edit {CONFIG_FILE} and run --install again")
         return 2
     state, old = ensure_cron(cfg, dry_run)
@@ -1207,16 +1276,26 @@ def run_uninstall(cfg: Config, dry_run: bool) -> int:
     return 0
 
 
-def find_stacks(root: Path, ignore: set[str] = frozenset()) -> list[Path]:
-    if not root.is_dir():
-        raise FileNotFoundError(f"container_path does not exist: {root}")
-    return sorted(
-        (d for d in root.iterdir()
-         if d.is_dir() and not d.name.startswith(".") and d.name not in ignore
-         and d.resolve() != LAYOUT.data.resolve()
-         and any((d / f).is_file() for f in COMPOSE_FILES)),
-        key=lambda d: d.name.lower(),
-    )
+def find_stacks(roots: list[Path], ignore: set[str] = frozenset()) -> list[Path]:
+    existing = [root for root in roots if root.is_dir()]
+    if not existing:
+        raise FileNotFoundError(f"stacks_directory does not exist: {', '.join(map(str, roots))}")
+    for root in roots:
+        if root not in existing:
+            say(yellow(f"{SYM['warn']} stacks_directory not found, skipped: {root}"))
+    found: dict[str, Path] = {}
+    for root in dict.fromkeys(r.resolve() for r in existing):
+        for d in sorted(root.iterdir()):
+            if not (d.is_dir() and not d.name.startswith(".") and d.name not in ignore
+                    and d.resolve() != LAYOUT.data.resolve()
+                    and any((d / f).is_file() for f in COMPOSE_FILES)):
+                continue
+            if d.name in found:
+                say(yellow(f"{SYM['warn']} Stack '{d.name}' in {root} skipped: "
+                           f"{found[d.name].parent} already has a stack with that name"))
+                continue
+            found[d.name] = d
+    return sorted(found.values(), key=lambda d: d.name.lower())
 
 
 def parse_selection(text: str, count: int) -> list[int] | None:
@@ -1248,8 +1327,7 @@ def pick_stacks_by_name(names: list[str], stacks: list[Path], cfg: Config) -> li
         if stack is None:
             if name in cfg.ignore_folders:
                 raise ValueError(f"Stack '{name}' is in ignore_folders in TugBoat.conf")
-            folder = cfg.container_path / name
-            if folder.is_dir():
+            if any((root / name).is_dir() for root in cfg.stacks_dirs):
                 raise ValueError(f"'{name}' has no compose file ({', '.join(COMPOSE_FILES)})")
             raise ValueError(f"No stack named '{name}'. Available: {', '.join(by_name)}")
         if stack not in picked:
@@ -3003,7 +3081,7 @@ def main() -> int:
                 ensure_root()
             banner()
             return run_self_update(args.dry_run)
-        cfg = load_config(CONFIG_FILE)
+        cfg = load_config(config_source())
         REGISTRY_TIMEOUT = cfg.registry_timeout
         if cfg.require_root and not args.dry_run:
             ensure_root(non_interactive=args.auto or not sys.stdin.isatty())
@@ -3018,27 +3096,33 @@ def main() -> int:
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
         if not args.dry_run:
-            migrate_layout(LAYOUT, CONFIG_FILE.name, SCRIPT_NAME)
+            if migrate_layout(LAYOUT, LAYOUT.old_config.name, SCRIPT_NAME) and CONFIG_FILE.is_file() \
+                    and not LAYOUT.old_config.exists():
+                say(green(f"{SYM['ok']} Moved TugBoat's files into {LAYOUT.data}"))
+        conf_path = config_source()
         try:
-            created = not CONFIG_FILE.is_file()
+            created = not conf_path.is_file()
             added, removed, changed = sync_config(
-                CONFIG_FILE, write=not args.dry_run,
-                before_change=lambda key, old, new: relocate_default_data(key, old, new, CONFIG_FILE.parent))
+                conf_path, write=not args.dry_run,
+                before_change=lambda key, old, new: relocate_default_data(key, old, new, SCRIPT_DIR))
         except OSError as e:
             say(yellow(f"{SYM['warn']} Config not updated: {e.strerror or e}"))
         else:
             verb = "would be " if args.dry_run else ""
             if created and added:
-                say(green(f"{SYM['ok']} Default config {verb}created: {CONFIG_FILE}"))
+                say(green(f"{SYM['ok']} Default config {verb}created: {conf_path}"))
             elif added:
                 say(green(f"{SYM['ok']} Config: setting(s) {verb}added with defaults: {', '.join(added)}"))
             if removed:
                 say(green(f"{SYM['ok']} Config: obsolete setting(s) {verb}removed: {', '.join(removed)}"))
             for key, old, new in changed:
+                if key in RENAMED_CONFIG_KEYS:
+                    say(green(f"{SYM['ok']} Config: {key} {verb}renamed to {new}"))
+                    continue
                 say(green(f"{SYM['ok']} Config: {key} {verb}moved to the new default: "
                           f"{old or '(empty)'} {SYM['arrow']} {new or '(empty)'}"))
             if (added or removed or changed) and not args.dry_run:
-                cfg = load_config(CONFIG_FILE)
+                cfg = load_config(conf_path)
         if cfg.icons and not args.dry_run:
             ICONS = IconStore(LAYOUT.cache / "icons", cfg.status_file.parent, cfg.icon_index_days)
         if args.uninstall:
@@ -3047,14 +3131,14 @@ def main() -> int:
             code = run_install(cfg, args.dry_run)
             if code or args.dry_run:
                 return code
-            found = find_stacks(cfg.container_path, cfg.ignore_folders)
+            found = find_stacks(cfg.stacks_dirs, cfg.ignore_folders)
             if found:
                 run_healthcheck(found, StatusDB(cfg.status_file), cfg.image_check,
                                 cfg.image_check_interval * 60)
             return 0
         db: StatusDB | None = None if args.dry_run else StatusDB(cfg.status_file)
         startup_update_check(cfg, args.dry_run, db)
-        stacks = find_stacks(cfg.container_path, cfg.ignore_folders)
+        stacks = find_stacks(cfg.stacks_dirs, cfg.ignore_folders)
         if cfg.manage_cron and not args.dry_run:
             state, old = ensure_cron(cfg, False)
             if state != "same":
@@ -3064,7 +3148,7 @@ def main() -> int:
         return 2
 
     if not stacks:
-        say(yellow(f"No stacks found in {cfg.container_path}"))
+        say(yellow(f"No stacks found in {', '.join(map(str, cfg.stacks_dirs))}"))
         return 0
 
     action: str | None = None
