@@ -16,7 +16,7 @@ import shlex
 import shutil
 import signal
 import stat
-import subprocess
+import subprocessadd
 import sys
 import threading
 import time
@@ -31,11 +31,34 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
 CRON_EVERY_MINUTES = 1
+
+CONFIG_DEFAULTS = {
+    "container_path": "/container-data",
+    "require_root": "true",
+    "status_file": "{container_path}/tugboat.json",
+    "ignore_folders": "",
+    "backup": "true",
+    "backup_path": "{container_path}/.backup/$STACK-NAME",
+    "backup_retention": "10",
+    "backup_large_mb": "0",
+    "backup_large_retention": "2",
+    "docker_user": "",
+    "health_wait": "60",
+    "image_check": "true",
+    "image_check_interval": "60",
+    "manage_cron": "true",
+    "install_dependencies": "true",
+    "command_timeout": "0",
+    "update_check": "true",
+    "auto_update": "true",
+}
+OBSOLETE_CONFIG_KEYS = ("docker_stack_up_cmd", "docker_stack_down_cmd", "docker_stack_start_cmd",
+                        "docker_stack_restore_cmd")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "TugBoat.conf"
@@ -399,7 +422,7 @@ def install_release(rel: dict, dry_run: bool) -> bool:
                  if CONFIG_FILE.is_file() else set())
         new_keys = [k for k in _conf_keys(example) if k not in local]
         if new_keys:
-            say(yellow(f"  {SYM['warn']} New config settings (defaults used until you add them): "
+            say(yellow(f"  {SYM['warn']} New config settings (added to your config on the next run): "
                        f"{', '.join(new_keys)}"))
             say(dim(f"    see {__git__}/blob/{rel['tag']}/TugBoat.conf"))
     except (URLError, OSError, HTTPException, UnicodeDecodeError):
@@ -489,7 +512,8 @@ class Config:
     backup: bool
     backup_path: str
     backup_retention: int
-    up_cmd: str
+    backup_large_mb: int
+    backup_large_retention: int
     ignore_folders: set[str]
     require_root: bool
     status_file: Path
@@ -501,6 +525,7 @@ class Config:
     image_check_interval: int
     command_timeout: int
     manage_cron: bool
+    install_dependencies: bool
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -534,48 +559,105 @@ def _strip_comment(value: str) -> str:
     return value
 
 
-def load_config(path: Path) -> Config:
-    if not path.is_file():
-        raise FileNotFoundError(f"Config file not found: {path}")
+CONFIG_KEY_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*:")
 
+
+def parse_config_text(text: str, name: str) -> dict[str, str]:
     raw: dict[str, str] = {}
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for lineno, line in enumerate(text.lstrip("\ufeff").splitlines(), 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if ":" not in stripped:
-            raise ValueError(f"{path.name} line {lineno}: expected 'key: value'")
+            raise ValueError(f"{name} line {lineno}: expected 'key: value'")
         key, value = stripped.split(":", 1)
         value = _strip_comment(value).strip().strip('"').strip("'")
         raw[key.strip().lower()] = value
+    return raw
 
-    required = ("container_path", "docker_stack_up_cmd")
-    missing = [k for k in required if not raw.get(k)]
-    if missing:
-        raise ValueError(f"Missing required config value(s): {', '.join(missing)}")
+
+def config_default(key: str, raw: dict[str, str]) -> str:
+    container = raw.get("container_path") or CONFIG_DEFAULTS["container_path"]
+    return CONFIG_DEFAULTS[key].replace("{container_path}", container)
+
+
+def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str]]:
+    exists = path.is_file()
+    text = path.read_bytes().decode("utf-8") if exists else ""
+    raw = parse_config_text(text, path.name)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    present: set[str] = set()
+    removed: list[str] = []
+    kept: list[str] = []
+    for line in text.splitlines(keepends=True):
+        match = None if line.lstrip("\ufeff").lstrip().startswith("#") else CONFIG_KEY_RE.match(line.lstrip("\ufeff"))
+        key = match.group(1).lower() if match else ""
+        if key in OBSOLETE_CONFIG_KEYS:
+            removed.append(key)
+            continue
+        if key:
+            present.add(key)
+        kept.append(line)
+    missing = [key for key in CONFIG_DEFAULTS if key not in present]
+    if not missing and not removed:
+        return [], []
+    out = "".join(kept)
+    if missing and out and not out.endswith(("\n", "\r")):
+        out += newline
+    out += "".join(f"{key}: {config_default(key, raw)}".rstrip() + newline for key in missing)
+    if write:
+        tmp = path.with_name(f".{path.name}.new")
+        try:
+            if exists:
+                path.with_name(f".{path.name}.bak").write_bytes(text.encode("utf-8"))
+            tmp.write_bytes(out.encode("utf-8"))
+            if exists:
+                st = path.stat()
+                os.chmod(tmp, st.st_mode)
+                try:
+                    os.chown(tmp, st.st_uid, st.st_gid)
+                except PermissionError:
+                    pass
+            else:
+                os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+    return missing, removed
+
+
+def load_config(path: Path) -> Config:
+    raw = parse_config_text(path.read_bytes().decode("utf-8"), path.name) if path.is_file() else {}
+
+    def get(key: str) -> str:
+        value = raw.get(key)
+        if value is None or (not value and key == "container_path"):
+            return config_default(key, raw)
+        return value
 
     def resolve(value: str | Path) -> Path:
         return path.parent / Path(value).expanduser()
 
-    container_path = resolve(raw["container_path"])
     return Config(
-        container_path=container_path,
-        backup=_parse_bool(raw.get("backup", "true"), "backup"),
-        backup_path=str(resolve(raw.get("backup_path") or container_path / ".backup" / STACK_PLACEHOLDER)),
-        backup_retention=_parse_int(raw.get("backup_retention", "10"), "backup_retention"),
-        up_cmd=raw["docker_stack_up_cmd"],
-        ignore_folders={n.strip().strip("/") for n in raw.get("ignore_folders", "").split(",")
-                        if n.strip()},
-        require_root=_parse_bool(raw.get("require_root", "true"), "require_root"),
-        docker_user=raw.get("docker_user", "").strip(),
-        update_check=_parse_bool(raw.get("update_check", "true"), "update_check"),
-        auto_update=_parse_bool(raw.get("auto_update", "true"), "auto_update"),
-        status_file=resolve(raw.get("status_file") or container_path / "tugboat.json"),
-        health_wait=_parse_int(raw.get("health_wait", "60"), "health_wait"),
-        image_check=_parse_bool(raw.get("image_check", "true"), "image_check"),
-        image_check_interval=_parse_int(raw.get("image_check_interval", "60"), "image_check_interval"),
-        command_timeout=_parse_int(raw.get("command_timeout", "0"), "command_timeout"),
-        manage_cron=_parse_bool(raw.get("manage_cron", "true"), "manage_cron"),
+        container_path=resolve(get("container_path")),
+        backup=_parse_bool(get("backup"), "backup"),
+        backup_path=str(resolve(get("backup_path") or config_default("backup_path", raw))),
+        backup_retention=_parse_int(get("backup_retention"), "backup_retention"),
+        backup_large_mb=_parse_int(get("backup_large_mb"), "backup_large_mb"),
+        backup_large_retention=_parse_int(get("backup_large_retention"), "backup_large_retention"),
+        ignore_folders={n.strip().strip("/") for n in get("ignore_folders").split(",") if n.strip()},
+        require_root=_parse_bool(get("require_root"), "require_root"),
+        docker_user=get("docker_user").strip(),
+        update_check=_parse_bool(get("update_check"), "update_check"),
+        auto_update=_parse_bool(get("auto_update"), "auto_update"),
+        status_file=resolve(get("status_file") or config_default("status_file", raw)),
+        health_wait=_parse_int(get("health_wait"), "health_wait"),
+        image_check=_parse_bool(get("image_check"), "image_check"),
+        image_check_interval=_parse_int(get("image_check_interval"), "image_check_interval"),
+        command_timeout=_parse_int(get("command_timeout"), "command_timeout"),
+        manage_cron=_parse_bool(get("manage_cron"), "manage_cron"),
+        install_dependencies=_parse_bool(get("install_dependencies"), "install_dependencies"),
     )
 
 
@@ -631,6 +713,124 @@ def acquire_run_lock():
         handle.close()
         raise RuntimeError("Another TugBoat run is changing stacks right now - try again when it is done")
     return handle
+
+
+PACKAGES = {
+    "docker": {"apt-get": [["docker.io"]], "dnf": [["moby-engine"], ["docker-ce"]], "pacman": [["docker"]]},
+    "compose": {"apt-get": [["docker-compose-v2"], ["docker-compose-plugin"], ["docker-compose"]],
+                "dnf": [["docker-compose"], ["docker-compose-plugin"]], "pacman": [["docker-compose"]]},
+    "cron": {"apt-get": [["cron"]], "dnf": [["cronie"]], "pacman": [["cronie"]]},
+}
+SERVICES = {
+    "docker": {"apt-get": "docker", "dnf": "docker", "pacman": "docker"},
+    "cron": {"apt-get": "cron", "dnf": "crond", "pacman": "cronie"},
+}
+DEPS_FAILED = SCRIPT_DIR / ".TugBoat.deps.failed"
+DEPS_RETRY_SECONDS = 3600
+DEPS_TIMEOUT = 900
+
+
+def package_manager() -> str | None:
+    return next((tool for tool in ("apt-get", "dnf", "pacman") if shutil.which(tool)), None)
+
+
+def dependency_present(name: str) -> bool:
+    if name == "docker":
+        return shutil.which("docker") is not None
+    if name == "cron":
+        return shutil.which("crontab") is not None
+    if shutil.which("docker") is None:
+        return False
+    try:
+        return subprocess.run(["docker", "compose", "version"], capture_output=True, stdin=subprocess.DEVNULL,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def missing_dependencies(need_docker: bool, need_cron: bool) -> list[str]:
+    missing: list[str] = []
+    if need_docker:
+        if not dependency_present("docker"):
+            missing += ["docker", "compose"]
+        elif not dependency_present("compose"):
+            missing.append("compose")
+    if need_cron and not dependency_present("cron"):
+        missing.append("cron")
+    return missing
+
+
+def install_command(tool: str, packages: list[str]) -> list[str]:
+    names = " ".join(shlex.quote(name) for name in packages)
+    if tool == "apt-get":
+        return [f"DEBIAN_FRONTEND=noninteractive apt-get install -y {names}"]
+    if tool == "dnf":
+        return [f"dnf install -y {names}"]
+    return [f"pacman -S --noconfirm --needed {names}", f"pacman -Sy --noconfirm --needed {names}"]
+
+
+def install_dependencies(missing: list[str], tool: str, verbose: bool, dry_run: bool) -> list[str]:
+    ui = Runner(verbose=verbose, dry_run=dry_run)
+    if dry_run:
+        for name in missing:
+            ui.dry(f"Install {name}", f"would install {' '.join(PACKAGES[name][tool][0])} with {tool}")
+        return []
+    if tool == "apt-get":
+        ui.step("Update package list", command_work("apt-get update -qq", SCRIPT_DIR), warn_only=True,
+                timeout=DEPS_TIMEOUT)
+    remaining: list[str] = []
+    for name in missing:
+        if dependency_present(name):
+            continue
+        for packages in PACKAGES[name][tool]:
+            for command in install_command(tool, packages):
+                if ui.step(f"Install {name}", command_work(command, SCRIPT_DIR), timeout=DEPS_TIMEOUT).ok:
+                    break
+            if dependency_present(name):
+                break
+        if not dependency_present(name):
+            remaining.append(name)
+            continue
+        service = SERVICES.get(name, {}).get(tool)
+        if service and shutil.which("systemctl"):
+            ui.step(f"Start {service}", command_work(f"systemctl enable --now {service}", SCRIPT_DIR),
+                    warn_only=True, timeout=120)
+    return remaining
+
+
+def deps_recently_failed() -> bool:
+    try:
+        return time.time() - DEPS_FAILED.stat().st_mtime < DEPS_RETRY_SECONDS
+    except OSError:
+        return False
+
+
+def handle_dependencies(missing: list[str], cfg: Config, args: argparse.Namespace) -> list[str]:
+    names = ", ".join(missing)
+    tool = package_manager()
+    reason = ""
+    if not cfg.install_dependencies:
+        reason = "install_dependencies is off"
+    elif not args.dry_run and os.geteuid() != 0:
+        reason = "installing needs root"
+    elif tool is None:
+        reason = "no supported package manager (apt, dnf or pacman)"
+    elif not args.dry_run and deps_recently_failed():
+        reason = "the last install attempt failed less than an hour ago"
+    if reason:
+        say(yellow(f"{SYM['warn']} Missing: {names} ({reason})"))
+        return missing
+    say(f"\n{bold('Installing missing dependencies')}: {names}")
+    remaining = install_dependencies(missing, tool, args.verbose, args.dry_run)
+    if not args.dry_run:
+        try:
+            if remaining:
+                DEPS_FAILED.write_text(", ".join(remaining) + "\n", encoding="utf-8")
+            else:
+                DEPS_FAILED.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return remaining
 
 
 def action_running() -> bool:
@@ -925,6 +1125,7 @@ def ask_for_action() -> str | None:
     _menu_item("3", "Stop")
     _menu_item("4", "Health check")
     _menu_item("5", f"Restart  {dim('stop → start, no pull' if UNICODE else 'stop, start, no pull')}")
+    _menu_item("6", f"Rollback  {dim('restore a backup of one stack')}")
     _menu_item("q", dim("Quit"))
     while True:
         answer = _prompt()
@@ -940,6 +1141,8 @@ def ask_for_action() -> str | None:
             return "healthcheck"
         if answer in ("5", "r", "restart"):
             return "restart"
+        if answer in ("6", "rollback"):
+            return "rollback"
         say(yellow("  Invalid choice, try again."))
 
 
@@ -1061,19 +1264,41 @@ def backup_work(stack: Path, dest: Path) -> StepWork:
     return work
 
 
+def list_backups(stack: Path, cfg: Config) -> list[tuple[datetime, Path]]:
+    root = cfg.backup_root(stack.name)
+    backups: list[tuple[datetime, Path]] = []
+    if root.is_dir():
+        for d in root.iterdir():
+            try:
+                if d.is_dir():
+                    backups.append((datetime.strptime(d.name, TIMESTAMP_FORMAT), d))
+            except ValueError:
+                continue
+    backups.sort(reverse=True)
+    return backups
+
+
+def tree_size_over(root: Path, limit: int) -> bool:
+    total = 0
+    for folder, _, files in os.walk(root):
+        for name in files:
+            try:
+                st = os.lstat(os.path.join(folder, name))
+            except OSError:
+                continue
+            total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+            if total > limit:
+                return True
+    return False
+
+
 def prune_work(stack: Path, cfg: Config) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
-        root = cfg.backup_root(stack.name)
-        backups: list[tuple[datetime, Path]] = []
-        if root.is_dir():
-            for d in root.iterdir():
-                try:
-                    if d.is_dir():
-                        backups.append((datetime.strptime(d.name, TIMESTAMP_FORMAT), d))
-                except ValueError:
-                    continue
-        backups.sort(reverse=True)
-        old = backups[cfg.backup_retention:]
+        backups = list_backups(stack, cfg)
+        keep, why = cfg.backup_retention, ""
+        if cfg.backup_large_mb > 0 and backups and tree_size_over(backups[0][1], cfg.backup_large_mb * 1024 * 1024):
+            keep, why = max(1, cfg.backup_large_retention), f", backup is over {cfg.backup_large_mb} MB"
+        old = backups[keep:] if keep > 0 else []
         failed: list[str] = []
         for _, d in old:
             emit(f"removing {d.name}")
@@ -1081,11 +1306,11 @@ def prune_work(stack: Path, cfg: Config) -> StepWork:
                 shutil.rmtree(d)
             except OSError as e:
                 failed.append(f"{d}: {e}")
-        kept = min(len(backups), cfg.backup_retention)
+        kept = len(backups) - len(old)
         if failed:
             return False, f"{len(failed)} old backup(s) could not be removed", failed
         removed = f"removed {len(old)}, " if old else ""
-        return True, f"{removed}keeping {kept}/{cfg.backup_retention}", []
+        return True, f"{removed}keeping {kept}/{keep if keep > 0 else 'all'}{why}", []
     return work
 
 
@@ -1808,6 +2033,15 @@ def check_all(stacks: list[Path]) -> dict[str, dict]:
     return snaps
 
 
+def fmt_age(seconds: float) -> str:
+    if seconds < 90:
+        return "just now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit} ago"
+    return ""
+
+
 def fmt_ago(iso: str | None) -> str:
     if not iso:
         return ""
@@ -1815,12 +2049,7 @@ def fmt_ago(iso: str | None) -> str:
         seconds = (datetime.now().astimezone() - datetime.fromisoformat(iso)).total_seconds()
     except ValueError:
         return ""
-    if seconds < 90:
-        return "just now"
-    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
-        if seconds >= size:
-            return f"{int(seconds // size)}{unit} ago"
-    return ""
+    return fmt_age(seconds)
 
 
 def print_health_table(stacks: list[Path], snaps: dict[str, dict], db: StatusDB | None,
@@ -1924,12 +2153,12 @@ def _fail(res: StackResult, step: str, out: StepOutcome, status: str) -> StackRe
 
 
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
-COMPOSE_STOP = "docker compose stop"
-COMPOSE_START = "docker compose start"
-COMPOSE_CREATE = "docker compose up -d --pull never"
+COMPOSE_CREATE = "docker compose up -d --pull missing"
+UPDATE_CMD = "docker compose pull && docker compose up -d --remove-orphans"
+STOP_DRY = "would stop each running container with: docker container stop <name>"
 OLD_CONTAINERS_DRY = "would remove containers from outside the stack that use the same names"
-START_DRY = (f"would run: {COMPOSE_START}, and create missing containers with "
-             f"{COMPOSE_CREATE} --force-recreate --no-deps <service>")
+START_DRY = ("would start each stopped container with: docker container start <name>, and create "
+             f"missing ones with: {COMPOSE_CREATE} --force-recreate --no-deps <service>")
 
 
 def name_conflicts(stack: Path) -> tuple[list[dict], list[str]]:
@@ -1995,13 +2224,54 @@ def clear_old_containers(stack: Path, ui: Runner) -> StepOutcome | None:
     return ui.step("Old containers", clear_work(remove, blocked))
 
 
-def compose_services(stack: Path) -> list[str] | None:
+def compose_order(stack: Path) -> list[str] | None:
     rc, out, _ = docker(["compose", "config", "--format", "json"], cwd=stack)
     try:
         services = json.loads(out).get("services") if rc == 0 else None
     except (ValueError, AttributeError):
         services = None
-    return sorted(services) if isinstance(services, dict) else None
+    if not isinstance(services, dict):
+        return None
+    needs = {}
+    for name, spec in services.items():
+        wanted = spec.get("depends_on") if isinstance(spec, dict) else None
+        needs[name] = sorted(wanted) if isinstance(wanted, (list, dict)) else []
+    order: list[str] = []
+    pending = sorted(needs)
+    while pending:
+        ready = [name for name in pending if all(d in order or d not in needs for d in needs[name])]
+        chosen = (ready or pending)[0]
+        order.append(chosen)
+        pending.remove(chosen)
+    return order
+
+
+def in_order(containers: list[dict], order: list[str] | None, reverse: bool = False) -> list[dict]:
+    rank = {name: i for i, name in enumerate(order or [])}
+    return sorted(containers, key=lambda c: (rank.get(c["service"], len(rank)), c["name"]), reverse=reverse)
+
+
+def container_cmd(verb: str, names: list[str]) -> str:
+    steps = "; ".join(f"docker container {verb} {shlex.quote(name)} || rc=1" for name in names)
+    return f"rc=0; {steps}; exit $rc"
+
+
+def unreadable(ui: Runner, label: str, err: str) -> StepOutcome:
+    note = f"could not read the stack: {err}"
+    ui._line("fail", label, None, red(note))
+    return StepOutcome(False, False, note, [], [], 0.0)
+
+
+def stop_containers(stack: Path, cfg: Config, ui: Runner) -> StepOutcome:
+    containers, err = compose_ps(stack)
+    if containers is None:
+        return unreadable(ui, "Stop", err)
+    active = [c for c in containers if c["name"] and c["state"] in ("running", "restarting", "paused")]
+    if not active:
+        ui.skip("Stop", "no running containers")
+        return StepOutcome(True, False, "", [], [], 0.0)
+    names = [c["name"] for c in in_order(active, compose_order(stack), reverse=True)]
+    return ui.step("Stop", command_work(container_cmd("stop", names), stack), timeout=cfg.command_timeout)
 
 
 def create_cmd(services: list[str]) -> str:
@@ -2014,21 +2284,27 @@ def start_containers(stack: Path, cfg: Config, ui: Runner) -> tuple[str, StepOut
     old = clear_old_containers(stack, ui)
     if old and not old.ok:
         return "Old containers", old
-    containers = compose_ps(stack)[0] or []
-    declared = compose_services(stack)
-    existing = {c["service"] for c in containers}
-    redo = [name for name in declared if name not in existing] if declared is not None else []
-    started: StepOutcome | None = None
-    if containers:
-        started = ui.step("Start", command_work(COMPOSE_START, stack), timeout=cfg.command_timeout)
-        if not started.ok:
-            after = compose_ps(stack)[0] or []
-            redo = sorted(set(redo) | {c["service"] for c in after if c["service"] and c["state"] != "running"})
-    elif declared is None:
+    containers, err = compose_ps(stack)
+    if containers is None:
+        return "Start", unreadable(ui, "Start", err)
+    declared = compose_order(stack)
+    if not containers and declared is None:
         out = ui.step("Create", command_work(create_cmd([]), stack), timeout=cfg.command_timeout)
         return None if out.ok else ("Create", out)
+    existing = {c["service"] for c in containers}
+    redo = {name for name in declared or [] if name not in existing}
+    redo |= {c["service"] for c in containers if c["state"] == "dead" and c["service"]}
+    to_start = [c for c in in_order(containers, declared) if c["name"] and c["state"] in ("exited", "created")]
+    started: StepOutcome | None = None
+    if to_start:
+        command = container_cmd("start", [c["name"] for c in to_start])
+        started = ui.step("Start", command_work(command, stack), timeout=cfg.command_timeout)
+        if not started.ok:
+            after = compose_ps(stack)[0] or []
+            redo |= {c["service"] for c in after if c["service"] and c["state"] != "running"}
     if redo:
-        out = ui.step("Create", command_work(create_cmd(redo), stack), timeout=cfg.command_timeout)
+        names = [name for name in declared or sorted(redo) if name in redo]
+        out = ui.step("Create", command_work(create_cmd(names), stack), timeout=cfg.command_timeout)
         if not out.ok:
             return "Create", out
     elif started is not None and not started.ok:
@@ -2059,10 +2335,10 @@ def start_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
 def stop_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     res = StackResult(stack.name)
     if ui.dry_run:
-        ui.dry("Stop", f"would run: {COMPOSE_STOP}")
+        ui.dry("Stop", STOP_DRY)
         res.status = "would stop"
         return res
-    out = ui.step("Stop", command_work(COMPOSE_STOP, stack), timeout=cfg.command_timeout)
+    out = stop_containers(stack, cfg, ui)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed")
     res.status = "stopped"
@@ -2072,13 +2348,13 @@ def stop_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
 def restart_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     res = StackResult(stack.name)
     if ui.dry_run:
-        ui.dry("Stop", f"would run: {COMPOSE_STOP}")
+        ui.dry("Stop", STOP_DRY)
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
         ui.dry("Start", START_DRY)
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
         res.status = "would restart"
         return res
-    out = ui.step("Stop", command_work(COMPOSE_STOP, stack), timeout=cfg.command_timeout)
+    out = stop_containers(stack, cfg, ui)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
     failed = start_containers(stack, cfg, ui)
@@ -2102,6 +2378,125 @@ def _restart_old(stack: Path, cfg: Config, ui: Runner, res: StackResult, what: s
     return res
 
 
+def ask_for_backup(stack: Path, backups: list[tuple[datetime, Path]]) -> Path | None:
+    say("\n" + bold(f"Backups of {stack.name}"))
+    for i, (when, folder) in enumerate(backups, 1):
+        age = fmt_age((datetime.now() - when).total_seconds())
+        _menu_item(str(i), f"{folder.name}  {dim(when.strftime('%Y-%m-%d %H:%M') + ', ' + age)}")
+    _menu_item("q", dim("Quit"))
+    say(dim("  Enter = newest"))
+    while True:
+        answer = _prompt()
+        if answer is None or answer in ("q", "quit", "exit"):
+            return None
+        if answer == "":
+            return backups[0][1]
+        if answer.isdigit() and 1 <= int(answer) <= len(backups):
+            return backups[int(answer) - 1][1]
+        say(yellow("  Invalid choice, try again."))
+
+
+def restore_work(stack: Path, backup: Path) -> StepWork:
+    def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        try:
+            emit(f"clearing {stack}")
+            for entry in stack.iterdir():
+                if CANCEL.is_set():
+                    return False, "cancelled", []
+                if entry.is_symlink() or not entry.is_dir():
+                    entry.unlink()
+                else:
+                    shutil.rmtree(entry)
+            emit(f"copying {backup} -> {stack}")
+            shutil.copytree(backup, stack, symlinks=True, copy_function=_copy_file, dirs_exist_ok=True)
+            _copy_dir_owners(backup, stack)
+            return True, f"{SYM['arrow']} {backup.name}", []
+        except shutil.Error as e:
+            failures = e.args[0] if e.args and isinstance(e.args[0], list) else []
+            details = [f"{src}: {str(reason).split(']')[-1].split(':')[0].strip()}"
+                       for src, _, reason in failures[:10]]
+            if len(failures) > 10:
+                details.append(f"... and {len(failures) - 10} more")
+            note = "cancelled" if CANCEL.is_set() else f"{len(failures)} file(s) could not be restored"
+            return False, note, details
+        except OSError as e:
+            return False, str(e), []
+    return work
+
+
+def rollback_stack(stack: Path, cfg: Config, backup: Path, safety_backup: bool, ui: Runner) -> StackResult:
+    res = StackResult(stack.name)
+    if backup_inside_stack(stack, cfg):
+        note = f"backup_path {cfg.backup_root(stack.name)} is inside the stack folder"
+        ui._line("fail", "Rollback", None, red(note))
+        res.ok, res.status = False, "not rolled back"
+        res.errors.append(Issue(res.name, "Rollback", note, ["Change backup_path in TugBoat.conf."]))
+        return res
+    if ui.dry_run:
+        ui.dry("Stop", STOP_DRY)
+        if safety_backup:
+            ui.dry("Safety backup", f"would copy the current state to {cfg.backup_root(stack.name)}/<timestamp>")
+        else:
+            ui.skip("Safety backup", "skipped")
+        ui.dry("Restore", f"would replace the stack folder with {backup}")
+        ui.dry("Old containers", OLD_CONTAINERS_DRY)
+        ui.dry("Recreate", f"would run: {COMPOSE_CREATE} --force-recreate --remove-orphans")
+        ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
+        res.status = "would roll back"
+        return res
+
+    out = stop_containers(stack, cfg, ui)
+    if not out.ok:
+        return _fail(res, "Stop", out, "stop failed, left as is")
+
+    if safety_backup:
+        dest = new_backup_dest(stack, cfg)
+        out = ui.step("Safety backup", backup_work(stack, dest))
+        if not out.ok:
+            _fail(res, "Safety backup", out, "backup failed")
+            return _restart_old(stack, cfg, ui, res, "rollback")
+        res.backup = str(dest)
+    else:
+        ui.skip("Safety backup", "skipped")
+
+    kept = f" - the state before the rollback is in {res.backup}" if res.backup else ""
+    out = ui.step("Restore", restore_work(stack, backup))
+    if not out.ok:
+        return _fail(res, "Restore", out, f"restore failed, stack is stopped{kept}")
+
+    old = clear_old_containers(stack, ui)
+    if old and not old.ok:
+        return _fail(res, "Old containers", old, f"rollback failed, stack is stopped{kept}")
+
+    services = compose_order(stack)
+    command = create_cmd(services) if services else f"{COMPOSE_CREATE} --force-recreate"
+    out = ui.step("Recreate", command_work(f"{command} --remove-orphans", stack), timeout=cfg.command_timeout)
+    if not out.ok:
+        return _fail(res, "Recreate", out, f"restored, but the containers could not be created{kept}")
+
+    out = ui.step("Health check", health_work(stack, cfg, res))
+    if out.warn:
+        res.warnings.append(Issue(res.name, "Health check", out.note, out.details, out.output))
+    elif not out.ok:
+        return _fail(res, "Health check", out, "rolled back but unhealthy")
+
+    res.status = "rolled back"
+    return res
+
+
+def run_list_backups(stacks: list[Path], cfg: Config) -> int:
+    for stack in stacks:
+        backups = list_backups(stack, cfg)
+        rule(f"{stack.name} ({len(backups)})")
+        if not backups:
+            say(dim("  no backups"))
+        for when, folder in backups:
+            age = fmt_age((datetime.now() - when).total_seconds())
+            say(f"  {folder.name}  {dim(when.strftime('%Y-%m-%d %H:%M') + ', ' + age)}")
+    say()
+    return 0
+
+
 def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> StackResult:
     res = StackResult(stack.name)
 
@@ -2113,19 +2508,21 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         return res
 
     if ui.dry_run:
-        ui.dry("Stop", f"would run: {COMPOSE_STOP}")
+        ui.dry("Stop", STOP_DRY)
         if do_backup:
             ui.dry("Backup", f"would copy to {cfg.backup_root(stack.name)}/<timestamp>")
-            ui.dry("Prune backups", f"would keep newest {cfg.backup_retention}")
+            large = (f", or {max(1, cfg.backup_large_retention)} when a backup is over {cfg.backup_large_mb} MB"
+                     if cfg.backup_large_mb > 0 else "")
+            ui.dry("Prune backups", f"would keep newest {cfg.backup_retention or 'all'}{large}")
         else:
             ui.skip("Backup", "skipped")
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
-        ui.dry("Pull & start", f"would run: {cfg.up_cmd}")
+        ui.dry("Pull & start", f"would run: {UPDATE_CMD}")
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
         res.status = "would update"
         return res
 
-    out = ui.step("Stop", command_work(COMPOSE_STOP, stack), timeout=cfg.command_timeout)
+    out = stop_containers(stack, cfg, ui)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
 
@@ -2137,7 +2534,7 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         if not out.ok:
             _fail(res, "Backup", out, "backup failed")
             return _restart_old(stack, cfg, ui, res, "backup")
-        if cfg.backup_retention > 0:
+        if cfg.backup_retention > 0 or cfg.backup_large_mb > 0:
             out = ui.step("Prune backups", prune_work(stack, cfg), warn_only=True)
             if not out.ok:
                 res.warnings.append(Issue(res.name, "Prune backups", out.note, out.details, out.output))
@@ -2151,7 +2548,7 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         _fail(res, "Old containers", old, "update failed")
         return _restart_old(stack, cfg, ui, res, "update")
 
-    out = ui.step("Pull & start", command_work(cfg.up_cmd, stack), timeout=cfg.command_timeout)
+    out = ui.step("Pull & start", command_work(UPDATE_CMD, stack), timeout=cfg.command_timeout)
     if not out.ok:
         _fail(res, "Pull & start", out, "update failed")
         return _restart_old(stack, cfg, ui, res, "update")
@@ -2232,10 +2629,14 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--update", nargs="*", metavar="STACK",
                       help="stop -> backup -> pull -> start -> health check")
-    mode.add_argument("--start", nargs="*", metavar="STACK", help="start the stack's containers, creating missing ones (never pulls)")
+    mode.add_argument("--start", nargs="*", metavar="STACK", help="start the stack's containers; a missing container is created, and its image pulled only if the host does not have it")
     mode.add_argument("--stop", nargs="*", metavar="STACK", help="stop the stack's containers (they are kept)")
     mode.add_argument("--restart", nargs="*", metavar="STACK",
                       help="stop -> start -> health check, without pulling new images")
+    mode.add_argument("--rollback", nargs="*", metavar="STACK",
+                      help="restore a backup of one stack (the current state is backed up first)")
+    mode.add_argument("--list-backups", nargs="*", metavar="STACK",
+                      help="list the backups of the stacks (all stacks if no names)")
     mode.add_argument("--healthcheck", nargs="*", metavar="STACK",
                       help="check status/health and new image versions, write the status file "
                            "(all stacks if no names)")
@@ -2255,7 +2656,10 @@ def main() -> int:
                         help="no questions: default action update, all stacks unless named, confirm everything")
     parser.add_argument("--only-outdated", action="store_true",
                         help="update only stacks that have a new image version (update only)")
-    parser.add_argument("--skip-backup", action="store_true", help="skip the backup step (update only)")
+    parser.add_argument("--skip-backup", action="store_true",
+                        help="skip the backup step (update and rollback)")
+    parser.add_argument("--to", metavar="BACKUP",
+                        help="the backup to roll back to, by folder name or its start (rollback only)")
     images_opt = parser.add_mutually_exclusive_group()
     images_opt.add_argument("--no-image-check", action="store_true",
                             help="do not ask the registries for new image versions")
@@ -2287,9 +2691,28 @@ def main() -> int:
         if cfg.require_root and not args.dry_run:
             ensure_root(non_interactive=args.auto or not sys.stdin.isatty())
         banner()
+        needed = missing_dependencies(not args.uninstall, cfg.manage_cron or args.install or args.uninstall)
+        if needed:
+            needed = handle_dependencies(needed, cfg, args)
+        if "docker" in needed or "compose" in needed:
+            say_error("Docker with the Compose plugin is required - install it and run TugBoat again")
+            return 2
         user_warning = setup_docker_user(cfg.docker_user)
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
+        try:
+            created = not CONFIG_FILE.is_file()
+            added, removed = sync_config(CONFIG_FILE, write=not args.dry_run)
+        except OSError as e:
+            say(yellow(f"{SYM['warn']} Config not updated: {e.strerror or e}"))
+        else:
+            verb = "would be " if args.dry_run else ""
+            if created and added:
+                say(green(f"{SYM['ok']} Default config {verb}created: {CONFIG_FILE}"))
+            elif added:
+                say(green(f"{SYM['ok']} Config: setting(s) {verb}added with defaults: {', '.join(added)}"))
+            if removed:
+                say(green(f"{SYM['ok']} Config: obsolete setting(s) {verb}removed: {', '.join(removed)}"))
         if args.uninstall:
             return run_uninstall(cfg, args.dry_run)
         if args.install:
@@ -2318,7 +2741,16 @@ def main() -> int:
 
     action: str | None = None
     raw_names: list[str] = list(args.stack)
-    for a in ("update", "start", "stop", "restart", "healthcheck"):
+    if args.list_backups is not None:
+        wanted = [n.strip() for v in list(args.list_backups) + list(args.stack) for n in v.split(",") if n.strip()]
+        try:
+            chosen = pick_stacks_by_name(wanted, stacks, cfg) if wanted else stacks
+        except ValueError as e:
+            say_error(str(e))
+            return 2
+        return run_list_backups(chosen, cfg)
+
+    for a in ("update", "start", "stop", "restart", "rollback", "healthcheck"):
         value = getattr(args, a)
         if value is not None:
             action = a
@@ -2332,6 +2764,9 @@ def main() -> int:
         return 2
     if args.only_outdated and action not in (None, "update"):
         say_error("--only-outdated only works with --update.")
+        return 2
+    if args.to and action not in (None, "rollback"):
+        say_error("--to only works with --rollback.")
         return 2
 
     if db:
@@ -2358,6 +2793,43 @@ def main() -> int:
     if not selected:
         say(dim("Nothing selected, exiting."))
         return 0
+
+    rollback_to: Path | None = None
+    if action == "rollback":
+        if len(selected) != 1:
+            say_error("Roll back one stack at a time - name it, for example: --rollback web")
+            return 2
+        backups = list_backups(selected[0], cfg)
+        if not backups:
+            say_error(f"No backups of '{selected[0].name}' in {cfg.backup_root(selected[0].name)}")
+            return 2
+        if args.to:
+            matches = ([d for _, d in backups if d.name == args.to]
+                       or [d for _, d in backups if d.name.startswith(args.to)])
+            if len(matches) != 1:
+                say_error(f"{'No backup' if not matches else 'Several backups'} match '{args.to}'. "
+                          f"Available: {', '.join(d.name for _, d in backups)}")
+                return 2
+            rollback_to = matches[0]
+        elif args.auto:
+            rollback_to = backups[0][1]
+        elif sys.stdin.isatty():
+            rollback_to = ask_for_backup(selected[0], backups)
+        else:
+            say_error("Say which backup with --to NAME (see --list-backups), or use --auto for the newest")
+            return 2
+        if rollback_to is None:
+            say(dim("Nothing selected, exiting."))
+            return 0
+        if not (args.auto or args.dry_run):
+            if not sys.stdin.isatty():
+                say_error("Add --auto to confirm a rollback without a terminal")
+                return 2
+            answer = _prompt(f"Roll back {selected[0].name} to {rollback_to.name}? "
+                             f"The current state is backed up first. [y/N] ")
+            if answer not in ("y", "yes"):
+                say(dim("Cancelled."))
+                return 0
 
     image_check = (cfg.image_check or args.check_images) and not args.no_image_check
     if action == "healthcheck":
@@ -2389,6 +2861,9 @@ def main() -> int:
         plan.append(f"backup {'on' if do_backup else yellow('off')}")
         if args.only_outdated:
             plan.append("only outdated")
+    if action == "rollback":
+        plan.append(f"to {rollback_to.name}")
+        plan.append(f"safety backup {'off' if args.skip_backup else 'on'}")
     if cfg.docker_user:
         plan.append(f"docker as {cfg.docker_user}")
     plan.append(datetime.now().strftime("%Y-%m-%d %H:%M"))
@@ -2441,6 +2916,8 @@ def main() -> int:
                 res = start_stack(stack, cfg, ui)
             elif action == "restart":
                 res = restart_stack(stack, cfg, ui)
+            elif action == "rollback":
+                res = rollback_stack(stack, cfg, rollback_to, not args.skip_backup, ui)
             elif action == "update":
                 res = update_stack(stack, cfg, do_backup, ui)
             else:

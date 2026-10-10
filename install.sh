@@ -15,17 +15,52 @@ say() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run as root:  wget -qO install.sh $RAW/install.sh && sudo sh install.sh"
-command -v python3 >/dev/null 2>&1 || fail "python3 is needed (Debian/Ubuntu: apt install python3)"
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || fail "Python 3.9 or newer is needed"
-command -v docker >/dev/null 2>&1 || fail "docker is not installed"
-command -v crontab >/dev/null 2>&1 || fail "cron is not installed (Debian/Ubuntu: apt install cron)"
+
+PM=""
+for tool in apt-get dnf pacman; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        PM="$tool"
+        break
+    fi
+done
+
+install_packages() {
+    case "$PM" in
+        apt-get) apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        dnf) dnf install -y "$@" ;;
+        pacman) pacman -S --noconfirm --needed "$@" || pacman -Sy --noconfirm --needed "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+python_ok() {
+    command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)'
+}
+
+if ! python_ok; then
+    [ "${TUGBOAT_INSTALL_DEPS:-1}" = "0" ] && fail "Python 3.9 or newer is needed"
+    [ -n "$PM" ] || fail "Python 3.9 or newer is needed, and no supported package manager (apt, dnf, pacman) was found"
+    PYTHON_PACKAGE=python3
+    [ "$PM" = "pacman" ] && PYTHON_PACKAGE=python
+    say "Installing $PYTHON_PACKAGE with $PM"
+    install_packages "$PYTHON_PACKAGE" || fail "could not install $PYTHON_PACKAGE"
+    python_ok || fail "Python 3.9 or newer is needed"
+fi
+
+DOCKER_USER="${TUGBOAT_DOCKER_USER:-}"
+if [ -n "$DOCKER_USER" ]; then
+    id "$DOCKER_USER" >/dev/null 2>&1 || fail "TUGBOAT_DOCKER_USER: the user '$DOCKER_USER' does not exist"
+fi
 
 if command -v wget >/dev/null 2>&1; then
     fetch() { wget -q -O "$2" "$1"; }
 elif command -v curl >/dev/null 2>&1; then
     fetch() { curl -fsSL -o "$2" "$1"; }
 else
-    fail "wget or curl is needed"
+    [ -n "$PM" ] || fail "wget or curl is needed"
+    say "Installing wget with $PM"
+    install_packages wget || fail "could not install wget"
+    fetch() { wget -q -O "$2" "$1"; }
 fi
 
 set_conf() {
@@ -57,6 +92,17 @@ mv "$SCRIPT.new" "$SCRIPT"
 
 if [ -f "$CONF" ]; then
     say "Keeping your existing $CONF"
+    if [ "${TUGBOAT_INSTALL_DEPS:-}" = "0" ]; then
+        set_conf install_dependencies false
+    fi
+    if [ -n "${TUGBOAT_CONTAINER_PATH:-}" ]; then
+        set_conf container_path "$TUGBOAT_CONTAINER_PATH"
+        say "container_path set to $TUGBOAT_CONTAINER_PATH"
+    fi
+    if [ -n "$DOCKER_USER" ]; then
+        set_conf docker_user "$DOCKER_USER"
+        say "docker_user set to $DOCKER_USER"
+    fi
 else
     fetch "$RAW/TugBoat.conf" "$CONF" || fail "could not download TugBoat.conf"
     chmod 644 "$CONF"
@@ -66,11 +112,15 @@ else
     fi
     CONTAINERS="$(awk -F': *' '$1 == "container_path" { print $2 }' "$CONF" | tr -d '\r')"
     set_conf status_file "$CONTAINERS/tugboat.json"
-    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-        set_conf docker_user "$SUDO_USER"
-        say "Docker commands will run as $SUDO_USER (docker_user in TugBoat.conf)"
-    else
-        set_conf docker_user ""
+    if [ -z "$DOCKER_USER" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        DOCKER_USER="$SUDO_USER"
+    fi
+    set_conf docker_user "$DOCKER_USER"
+    if [ "${TUGBOAT_INSTALL_DEPS:-}" = "0" ]; then
+        set_conf install_dependencies false
+    fi
+    if [ -n "$DOCKER_USER" ]; then
+        say "Docker commands will run as $DOCKER_USER (docker_user in TugBoat.conf)"
     fi
     say "Created $CONF"
 fi
@@ -80,7 +130,7 @@ if [ -d "$(dirname "$LINK")" ]; then
 fi
 
 say "Installed $SCRIPT"
-say "Setting up the health check cron job"
+say "Checking Docker and cron, then setting up the health check cron job"
 if python3 "$SCRIPT" --install; then
     say ""
     say "Done. Run it with:  sudo tugboat      (settings: $CONF)"
