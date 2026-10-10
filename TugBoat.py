@@ -31,11 +31,9 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
-
-CRON_EVERY_MINUTES = 1
 
 CONFIG_DEFAULTS = {
     "container_path": "/container-data",
@@ -44,18 +42,27 @@ CONFIG_DEFAULTS = {
     "ignore_folders": "",
     "backup": "true",
     "backup_path": "{container_path}/.backup/$STACK-NAME",
-    "backup_retention": "10",
-    "backup_large_mb": "0",
-    "backup_large_retention": "2",
+    "backup_retention": "15",
+    "backup_large_mb": "250",
+    "backup_large_retention": "5",
     "docker_user": "",
     "health_wait": "60",
     "image_check": "true",
     "image_check_interval": "60",
+    "registry_timeout": "10",
     "manage_cron": "true",
+    "healthcheck_interval": "1",
     "install_dependencies": "true",
     "command_timeout": "0",
     "update_check": "true",
+    "update_check_interval": "60",
     "auto_update": "true",
+}
+PREVIOUS_DEFAULTS = {
+    "backup_retention": ["10"],
+    "backup_large_mb": ["0"],
+    "backup_large_retention": ["2", "1"],
+    "healthcheck_interval": ["5"],
 }
 OBSOLETE_CONFIG_KEYS = ("docker_stack_up_cmd", "docker_stack_down_cmd", "docker_stack_start_cmd",
                         "docker_stack_restore_cmd")
@@ -305,7 +312,6 @@ GITHUB_REPO = __git__.rstrip("/").split("github.com/")[-1]
 GITHUB_API = "https://api.github.com"
 GITHUB_RAW = "https://raw.githubusercontent.com"
 UPDATED_ENV = "TUGBOAT_JUST_UPDATED"
-RELEASE_CHECK_INTERVAL = 3600
 
 
 def parse_version(v: str) -> tuple[int, ...]:
@@ -491,7 +497,7 @@ def startup_update_check(cfg: "Config", dry_run: bool, db: "StatusDB | None") ->
             say(green(f"{SYM['ok']} Updated to {__title__} {__version__}"))
         return
     cached = db.data.get("release_check") if db else None
-    if isinstance(cached, dict) and is_fresh(cached.get("checked_at"), RELEASE_CHECK_INTERVAL):
+    if isinstance(cached, dict) and is_fresh(cached.get("checked_at"), cfg.update_check_interval * 60):
         latest = str(cached.get("latest") or "")
         if parse_version(latest) > parse_version(__version__):
             say(yellow(f"{SYM['warn']} {__title__} {latest} is available (you have {__version__}) - "
@@ -537,6 +543,9 @@ class Config:
     image_check_interval: int
     command_timeout: int
     manage_cron: bool
+    healthcheck_interval: int
+    update_check_interval: int
+    registry_timeout: int
     install_dependencies: bool
 
     def backup_root(self, stack: str) -> Path:
@@ -593,13 +602,48 @@ def config_default(key: str, raw: dict[str, str]) -> str:
     return CONFIG_DEFAULTS[key].replace("{container_path}", container)
 
 
-def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str]]:
+def defaults_state_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.defaults")
+
+
+def load_defaults_state(path: Path) -> dict[str, str] | None:
+    try:
+        data = json.loads(defaults_state_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_defaults_state(path: Path) -> None:
+    target = defaults_state_path(path)
+    tmp = target.with_name(target.name + ".new")
+    try:
+        tmp.write_text(json.dumps(CONFIG_DEFAULTS, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
+def replace_config_value(line: str, new: str) -> str:
+    ending = line[len(line.rstrip("\r\n")):]
+    body = line.rstrip("\r\n")
+    bom = "\ufeff" if body.startswith("\ufeff") else ""
+    body = body[len(bom):]
+    head, _, rest = body.partition(":")
+    comment = next((rest[i:] for i, ch in enumerate(rest) if ch == "#" and (i == 0 or rest[i - 1].isspace())), "")
+    return f"{bom}{head}: {new}".rstrip() + (f"  {comment}" if comment else "") + ending
+
+
+def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
     exists = path.is_file()
     text = path.read_bytes().decode("utf-8") if exists else ""
     raw = parse_config_text(text, path.name)
     newline = "\r\n" if "\r\n" in text else "\n"
+    state = load_defaults_state(path)
+    container = raw.get("container_path") or CONFIG_DEFAULTS["container_path"]
     present: set[str] = set()
     removed: list[str] = []
+    changed: list[tuple[str, str, str]] = []
     kept: list[str] = []
     for line in text.splitlines(keepends=True):
         match = None if line.lstrip("\ufeff").lstrip().startswith("#") else CONFIG_KEY_RE.match(line.lstrip("\ufeff"))
@@ -609,10 +653,21 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str]]:
             continue
         if key:
             present.add(key)
+        if key in CONFIG_DEFAULTS and key in raw:
+            if state is None:
+                olds = PREVIOUS_DEFAULTS.get(key, [])
+            else:
+                olds = [state[key]] if key in state and state[key] != CONFIG_DEFAULTS[key] else []
+            new_value = config_default(key, raw)
+            if raw[key] != new_value and raw[key] in [old.replace("{container_path}", container) for old in olds]:
+                changed.append((key, raw[key], new_value))
+                line = replace_config_value(line, new_value)
         kept.append(line)
     missing = [key for key in CONFIG_DEFAULTS if key not in present]
-    if not missing and not removed:
-        return [], []
+    if not missing and not removed and not changed:
+        if write and state != CONFIG_DEFAULTS:
+            save_defaults_state(path)
+        return [], [], []
     out = "".join(kept)
     if missing and out and not out.endswith(("\n", "\r")):
         out += newline
@@ -636,7 +691,8 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[str]]:
         except OSError:
             tmp.unlink(missing_ok=True)
             raise
-    return missing, removed
+        save_defaults_state(path)
+    return missing, removed, changed
 
 
 def load_config(path: Path) -> Config:
@@ -669,6 +725,9 @@ def load_config(path: Path) -> Config:
         image_check_interval=_parse_int(get("image_check_interval"), "image_check_interval"),
         command_timeout=_parse_int(get("command_timeout"), "command_timeout"),
         manage_cron=_parse_bool(get("manage_cron"), "manage_cron"),
+        healthcheck_interval=_parse_int(get("healthcheck_interval"), "healthcheck_interval"),
+        update_check_interval=_parse_int(get("update_check_interval"), "update_check_interval"),
+        registry_timeout=max(1, _parse_int(get("registry_timeout"), "registry_timeout")),
         install_dependencies=_parse_bool(get("install_dependencies"), "install_dependencies"),
     )
 
@@ -882,7 +941,7 @@ def cron_schedule(minutes: int) -> str:
     if 60 <= minutes <= 1440 and minutes % 60 == 0:
         hours = minutes // 60
         return "0 * * * *" if hours == 1 else f"0 */{hours} * * *"
-    raise ValueError("CRON_EVERY_MINUTES must be 1-59 minutes or a whole number of hours "
+    raise ValueError("healthcheck_interval must be 1-59 minutes or a whole number of hours "
                      "(60, 120 ... 1440)")
 
 
@@ -993,7 +1052,7 @@ def plan_cron(current: str, line: str | None) -> tuple[str, str]:
 
 def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
     try:
-        schedule = cron_schedule(CRON_EVERY_MINUTES)
+        schedule = cron_schedule(cfg.healthcheck_interval)
     except ValueError as e:
         return "error", str(e)
     if shutil.which("crontab") is None:
@@ -1011,7 +1070,7 @@ def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
 
 
 def describe_cron(cfg: Config, state: str, old: str, dry_run: bool = False) -> str:
-    every = fmt_interval(CRON_EVERY_MINUTES)
+    every = fmt_interval(cfg.healthcheck_interval)
     if state == "error":
         return yellow(f"{SYM['warn']} Cron job not checked: {old} (manage_cron: false stops this check)")
     if state == "same":
@@ -1023,7 +1082,7 @@ def describe_cron(cfg: Config, state: str, old: str, dry_run: bool = False) -> s
         return f"{green(SYM['ok'])} Cron job added: health check {every}"
     match = CRON_SCHEDULE_RE.match(old)
     before = " ".join(match.group(1).split()) if match else ""
-    now = cron_schedule(CRON_EVERY_MINUTES)
+    now = cron_schedule(cfg.healthcheck_interval)
     if before and before != now:
         return f"{green(SYM['ok'])} Cron job updated: {dim(before)} {SYM['arrow']} {now}  ({every})"
     return f"{green(SYM['ok'])} Cron job updated to the current command  ({every})"
@@ -1040,7 +1099,7 @@ def run_install(cfg: Config, dry_run: bool) -> int:
         say_error(f"Could not set up the cron job: {old}")
         return 2
     say(describe_cron(cfg, state, old, dry_run))
-    say(dim("  Change CRON_EVERY_MINUTES at the top of TugBoat.py; TugBoat keeps the cron job in line on every run"))
+    say(dim(f"  Change healthcheck_interval in {CONFIG_FILE.name}; TugBoat keeps the cron job in line on every run"))
     return 0
 
 
@@ -1648,7 +1707,8 @@ def _manifest_digest(url: str, ref: ImageRef, timeout: float) -> str:
     raise RegistryError("registry did not return a digest")
 
 
-def remote_digest(ref: ImageRef, timeout: float = REGISTRY_TIMEOUT) -> str:
+def remote_digest(ref: ImageRef, timeout: float | None = None) -> str:
+    timeout = timeout or REGISTRY_TIMEOUT
     host = "registry-1.docker.io" if ref.registry == DOCKER_HUB else ref.registry
     local = host.split(":")[0] in ("localhost", "127.0.0.1")
     problem = "no answer"
@@ -1669,7 +1729,8 @@ def remote_digest(ref: ImageRef, timeout: float = REGISTRY_TIMEOUT) -> str:
     raise RegistryError(problem)
 
 
-def _registry_get(ref: ImageRef, path: str, accept: str, timeout: float = REGISTRY_TIMEOUT) -> bytes:
+def _registry_get(ref: ImageRef, path: str, accept: str, timeout: float | None = None) -> bytes:
+    timeout = timeout or REGISTRY_TIMEOUT
     base = _REGISTRY_BASE.get(ref.registry)
     if not base:
         raise RegistryError("registry not reached yet")
@@ -2631,6 +2692,7 @@ def _on_sigterm(signum, frame) -> None:
 
 
 def main() -> int:
+    global REGISTRY_TIMEOUT
     if sys.version_info < (3, 9):
         say_error(f"{__title__} needs Python 3.9 or newer (this is {sys.version.split()[0]})")
         return 2
@@ -2653,7 +2715,7 @@ def main() -> int:
                       help="check status/health and new image versions, write the status file "
                            "(all stacks if no names)")
     mode.add_argument("--install", action="store_true",
-                      help="set up the cron job that runs --healthcheck every CRON_EVERY_MINUTES "
+                      help="set up the cron job that runs --healthcheck every healthcheck_interval "
                            "minutes (TugBoat also keeps it in line on every run, see manage_cron)")
     mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job")
     mode.add_argument("--check-update", action="store_true",
@@ -2700,6 +2762,7 @@ def main() -> int:
             banner()
             return run_self_update(args.dry_run)
         cfg = load_config(CONFIG_FILE)
+        REGISTRY_TIMEOUT = cfg.registry_timeout
         if cfg.require_root and not args.dry_run:
             ensure_root(non_interactive=args.auto or not sys.stdin.isatty())
         banner()
@@ -2714,7 +2777,7 @@ def main() -> int:
             say(yellow(f"{SYM['warn']} {user_warning}"))
         try:
             created = not CONFIG_FILE.is_file()
-            added, removed = sync_config(CONFIG_FILE, write=not args.dry_run)
+            added, removed, changed = sync_config(CONFIG_FILE, write=not args.dry_run)
         except OSError as e:
             say(yellow(f"{SYM['warn']} Config not updated: {e.strerror or e}"))
         else:
@@ -2725,6 +2788,11 @@ def main() -> int:
                 say(green(f"{SYM['ok']} Config: setting(s) {verb}added with defaults: {', '.join(added)}"))
             if removed:
                 say(green(f"{SYM['ok']} Config: obsolete setting(s) {verb}removed: {', '.join(removed)}"))
+            for key, old, new in changed:
+                say(green(f"{SYM['ok']} Config: {key} {verb}moved to the new default: "
+                          f"{old or '(empty)'} {SYM['arrow']} {new or '(empty)'}"))
+            if (added or removed or changed) and not args.dry_run:
+                cfg = load_config(CONFIG_FILE)
         if args.uninstall:
             return run_uninstall(cfg, args.dry_run)
         if args.install:

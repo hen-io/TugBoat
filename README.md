@@ -54,17 +54,19 @@ Every health check and action writes `tugboat.json` (by default in your containe
 
 ## Configuration
 
-Settings are in `TugBoat.conf` in the scripts root folder.
+Settings are in `TugBoat.conf` in the scripts root folder. Missing settings are added with their default, and when a new version changes a default, a setting that still has the old default is moved to the new one (settings you changed yourself are never touched).
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `container_path` | `/container-data` | Folder that holds one sub-folder per stack |
 | `docker_user` | (none) | Run docker commands as this user |
-| `backup` / `backup_retention` | `true` / `10` | Back up a stack before updating, and how many backups to keep (`0` = keep all) |
-| `backup_large_mb` / `backup_large_retention` | `0` / `2` | If a stack's newest backup is bigger than this many MB, keep only this many backups instead of `backup_retention` (`0` = off) |
+| `backup` / `backup_retention` | `true` / `15` | Back up a stack before updating, and how many backups to keep (`0` = keep all) |
+| `backup_large_mb` / `backup_large_retention` | `250` / `5` | If a stack's newest backup is bigger than this many MB, keep only this many backups instead of `backup_retention` (`0` = off) |
 | `ignore_folders` | (none) | Comma-separated stack folders to leave alone |
 | `image_check_interval` | `60` | Minutes between checks for new images |
 | `auto_update` | `true` | Install new TugBoat versions automatically |
 | `manage_cron` | `true` | Let TugBoat keep its cron job in order |
 | `install_dependencies` | `true` | Install missing Docker, Compose plugin and cron (apt, dnf, pacman) |
-| `CRON_EVERY_MINUTES` | `5` | How often the --healthcheck cron job runs  |
+| `healthcheck_interval` | `1` | Minutes between runs of the health check cron job (1-59, or whole hours: 60, 120 ...) |
+| `update_check_interval` | `60` | Minutes between checks for a new TugBoat release |
+| `registry_timeout` | `10` | Seconds to wait for an image registry when checking for new images |
