@@ -31,9 +31,11 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
+
+CRON_EVERY_MINUTES = 1
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "TugBoat.conf"
@@ -502,7 +504,7 @@ class Config:
     image_check: bool
     image_check_interval: int
     command_timeout: int
-    healthcheck_interval: int
+    manage_cron: bool
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -580,7 +582,7 @@ def load_config(path: Path) -> Config:
         image_check=_parse_bool(raw.get("image_check", "true"), "image_check"),
         image_check_interval=_parse_int(raw.get("image_check_interval", "60"), "image_check_interval"),
         command_timeout=_parse_int(raw.get("command_timeout", "0"), "command_timeout"),
-        healthcheck_interval=_parse_int(raw.get("healthcheck_interval", "5"), "healthcheck_interval"),
+        manage_cron=_parse_bool(raw.get("manage_cron", "true"), "manage_cron"),
     )
 
 
@@ -675,7 +677,7 @@ def cron_schedule(minutes: int) -> str:
     if 60 <= minutes <= 1440 and minutes % 60 == 0:
         hours = minutes // 60
         return "0 * * * *" if hours == 1 else f"0 */{hours} * * *"
-    raise ValueError("healthcheck_interval must be 1-59 minutes or a whole number of hours "
+    raise ValueError("CRON_EVERY_MINUTES must be 1-59 minutes or a whole number of hours "
                      "(60, 120 ... 1440)")
 
 
@@ -720,57 +722,73 @@ def write_crontab(text: str) -> None:
         raise RuntimeError(_last_line(p.stderr, f"{' '.join(args)} exit code {p.returncode}"))
 
 
-def plan_cron(current: str, schedule: str) -> tuple[str, str]:
+def plan_cron(current: str, line: str) -> tuple[str, str]:
     lines = current.splitlines()
-    hits = [i for i, line in enumerate(lines) if is_tugboat_cron(line)]
+    hits = [i for i, text in enumerate(lines) if is_tugboat_cron(text)]
     if not hits:
-        lines.append(f"{schedule} {cron_command()}")
+        lines.append(line)
         return "\n".join(lines) + "\n", ""
-    match = CRON_SCHEDULE_RE.match(lines[hits[0]])
-    old = " ".join(match.group(1).split()) if match else ""
-    lines[hits[0]] = f"{schedule} {match.group(2)}" if match else f"{schedule} {cron_command()}"
+    old = lines[hits[0]]
+    lines[hits[0]] = line
     drop = set(hits[1:])
-    lines = [line for i, line in enumerate(lines) if i not in drop]
+    lines = [text for i, text in enumerate(lines) if i not in drop]
     return "\n".join(lines) + "\n", old
 
 
-def run_install(cfg: Config, dry_run: bool) -> int:
+def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
     try:
-        schedule = cron_schedule(cfg.healthcheck_interval)
+        schedule = cron_schedule(CRON_EVERY_MINUTES)
     except ValueError as e:
-        say_error(str(e))
-        return 2
+        return "error", str(e)
     if shutil.which("crontab") is None:
-        say_error("crontab not found - install cron first (Debian/Ubuntu: apt install cron)")
-        return 2
+        return "error", "crontab not found - install cron first (Debian/Ubuntu: apt install cron)"
+    try:
+        current = read_crontab()
+        updated, old = plan_cron(current, f"{schedule} {cron_command()}")
+        if updated.rstrip("\n") == current.rstrip("\n"):
+            return "same", ""
+        if not dry_run:
+            write_crontab(updated)
+    except RuntimeError as e:
+        return "error", f"could not update the crontab: {e}"
+    return ("updated" if old else "added"), old
+
+
+def describe_cron(cfg: Config, state: str, old: str, dry_run: bool = False) -> str:
+    every = fmt_interval(CRON_EVERY_MINUTES)
+    if state == "error":
+        return yellow(f"{SYM['warn']} Cron job not checked: {old} (manage_cron: false stops this check)")
+    if state == "same":
+        return f"{green(SYM['ok'])} Health check already runs {every}"
+    verb = {"added": "add", "updated": "update"}[state]
+    if dry_run:
+        return cyan(f"{SYM['dry']} Dry run - would {verb} the cron job: health check {every}")
+    if state == "added":
+        return f"{green(SYM['ok'])} Cron job added: health check {every}"
+    match = CRON_SCHEDULE_RE.match(old)
+    before = " ".join(match.group(1).split()) if match else ""
+    now = cron_schedule(CRON_EVERY_MINUTES)
+    if before and before != now:
+        return f"{green(SYM['ok'])} Cron job updated: {dim(before)} {SYM['arrow']} {now}  ({every})"
+    return f"{green(SYM['ok'])} Cron job updated to the current command  ({every})"
+
+
+def run_install(cfg: Config, dry_run: bool) -> int:
     if not cfg.container_path.is_dir():
         say_error(f"container_path does not exist: {cfg.container_path} - "
                   f"edit {CONFIG_FILE} and run --install again")
         return 2
-    every = fmt_interval(cfg.healthcheck_interval)
-    try:
-        current = read_crontab()
-        updated, old = plan_cron(current, schedule)
-        say()
-        if updated.rstrip("\n") == current.rstrip("\n"):
-            say(f"{green(SYM['ok'])} Health check already runs {every}")
-        elif dry_run:
-            verb = "change to" if old else "add"
-            say(cyan(f"{SYM['dry']} Dry run - would {verb} a cron job that runs the health check {every}"))
-        else:
-            write_crontab(updated)
-            if old:
-                say(f"{green(SYM['ok'])} Cron job updated: {dim(old)} {SYM['arrow']} {schedule}  ({every})")
-            else:
-                say(f"{green(SYM['ok'])} Cron job added: health check {every}")
-    except RuntimeError as e:
-        say_error(f"Could not update the crontab: {e}")
+    state, old = ensure_cron(cfg, dry_run)
+    say()
+    if state == "error":
+        say_error(f"Could not set up the cron job: {old}")
         return 2
-    say(dim(f"  Change healthcheck_interval in {CONFIG_FILE.name} and run --install again to change it"))
+    say(describe_cron(cfg, state, old, dry_run))
+    say(dim("  Change CRON_EVERY_MINUTES at the top of TugBoat.py; TugBoat keeps the cron job in line on every run"))
     return 0
 
 
-def run_uninstall(dry_run: bool) -> int:
+def run_uninstall(cfg: Config, dry_run: bool) -> int:
     if shutil.which("crontab") is None:
         say_error("crontab not found")
         return 2
@@ -790,6 +808,9 @@ def run_uninstall(dry_run: bool) -> int:
     except RuntimeError as e:
         say_error(f"Could not update the crontab: {e}")
         return 2
+    if cfg.manage_cron:
+        say(yellow(f"{SYM['warn']} manage_cron is on, so the next run adds it again - "
+                   f"set manage_cron: false in {CONFIG_FILE.name} to keep it off"))
     return 0
 
 
@@ -2139,8 +2160,8 @@ def main() -> int:
                       help="check status/health and new image versions, write the status file "
                            "(all stacks if no names)")
     mode.add_argument("--install", action="store_true",
-                      help="add (or update) the cron job that runs the health check "
-                           "every healthcheck_interval minutes")
+                      help="set up the cron job that runs --healthcheck every CRON_EVERY_MINUTES "
+                           "minutes (TugBoat also keeps it in line on every run, see manage_cron)")
     mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job")
     mode.add_argument("--check-update", action="store_true",
                       help="check GitHub for a newer TugBoat release")
@@ -2190,7 +2211,7 @@ def main() -> int:
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
         if args.uninstall:
-            return run_uninstall(args.dry_run)
+            return run_uninstall(cfg, args.dry_run)
         if args.install:
             code = run_install(cfg, args.dry_run)
             if code or args.dry_run:
@@ -2203,6 +2224,10 @@ def main() -> int:
         db: StatusDB | None = None if args.dry_run else StatusDB(cfg.status_file)
         startup_update_check(cfg, args.dry_run, db)
         stacks = find_stacks(cfg.container_path, cfg.ignore_folders)
+        if cfg.manage_cron and not args.dry_run:
+            state, old = ensure_cron(cfg, False)
+            if state != "same":
+                say(describe_cron(cfg, state, old))
     except (OSError, ValueError) as e:
         say_error(str(e))
         return 2
