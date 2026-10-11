@@ -2,7 +2,7 @@
 set -eu
 
 ROOT="${TUGBOAT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}"
-DATA="$ROOT/TugBoat"
+DATA="$ROOT/.TugBoat"
 STATE="$DATA/state"
 CONF="$DATA/TugBoat.conf"
 
@@ -63,7 +63,32 @@ absolute() {
     esac
 }
 
+merge() {
+    mkdir -p "$2"
+    for entry in "$1"/* "$1"/.[!.]*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        target="$2/$(basename "$entry")"
+        if [ ! -e "$target" ]; then
+            mv "$entry" "$target"
+        elif [ -d "$entry" ] && [ -d "$target" ]; then
+            merge "$entry" "$target"
+        fi
+    done
+    rmdir "$1" 2>/dev/null || true
+}
+
 mkdir -p "$STATE"
+
+OLD_DATA="$ROOT/TugBoat"
+if [ -d "$OLD_DATA" ] && [ ! -f "$OLD_DATA/compose.yaml" ] && [ ! -f "$OLD_DATA/compose.yml" ] \
+    && [ ! -f "$OLD_DATA/docker-compose.yaml" ] && [ ! -f "$OLD_DATA/docker-compose.yml" ]; then
+    merge "$OLD_DATA" "$DATA"
+    echo "moved $OLD_DATA -> $DATA"
+    if [ -d "$OLD_DATA" ]; then
+        rm -rf "$STATE/old-TugBoat-folder"
+        mv "$OLD_DATA" "$STATE/old-TugBoat-folder"
+    fi
+fi
 
 move "$ROOT/TugBoat.conf" "$CONF"
 move "$ROOT/.TugBoat.conf.bak" "$STATE/config.bak"
@@ -101,7 +126,9 @@ STACKS="${STACKS:-.}"
 STATUS="$(conf_get status_file)"
 if [ "$STATUS" = "$STACKS/tugboat.json" ] || [ "$STATUS" = "./tugboat.json" ]; then
     move "$(absolute "$STATUS")" "$DATA/tugboat.json"
-    conf_set status_file "./TugBoat/tugboat.json"
+    conf_set status_file "./.TugBoat/tugboat.json"
+elif [ "$STATUS" = "./TugBoat/tugboat.json" ]; then
+    conf_set status_file "./.TugBoat/tugboat.json"
 fi
 
 BACKUPS="$(conf_get backup_path)"
@@ -119,7 +146,9 @@ if [ "$BACKUPS" = "$STACKS/.backup/\$STACK-NAME" ]; then
         done
         rmdir "$OLD" 2>/dev/null || true
     fi
-    conf_set backup_path './TugBoat/backups/$STACK-NAME'
+    conf_set backup_path './.TugBoat/backups/$STACK-NAME'
+elif [ "$BACKUPS" = './TugBoat/backups/$STACK-NAME' ]; then
+    conf_set backup_path './.TugBoat/backups/$STACK-NAME'
 fi
 
 if cmp -s "$WORK" "$CONF"; then

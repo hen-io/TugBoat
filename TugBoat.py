@@ -31,18 +31,19 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
+
 __title__ = "TugBoat"
-__version__ = "0.7.1"
+__version__ = "0.7.3"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
 CONFIG_DEFAULTS = {
     "stacks_directory": "",
     "require_root": "true",
-    "status_file": "./TugBoat/tugboat.json",
+    "status_file": "./.TugBoat/tugboat.json",
     "ignore_folders": "",
     "backup": "true",
-    "backup_path": "./TugBoat/backups/$STACK-NAME",
+    "backup_path": "./.TugBoat/backups/$STACK-NAME",
     "backup_retention": "15",
     "backup_large_mb": "250",
     "backup_large_retention": "5",
@@ -79,7 +80,7 @@ CONFIG_HELP = {
     "image_check": "Check the registries for new image versions during the health check",
     "image_check_interval": "Minutes between registry checks per stack",
     "registry_timeout": "Seconds to wait for a registry to answer",
-    "icons": "Find a logo for each stack and image (saved in TugBoat/cache/icons)",
+    "icons": "Find a logo for each stack and image (saved in .TugBoat/cache/icons)",
     "icon_index_days": "Days between downloads of the icon index",
     "manage_cron": "Keep the health check cron job in line with this config",
     "healthcheck_interval": "Minutes between health checks (1-59, or whole hours: 60, 120 ...)",
@@ -117,14 +118,14 @@ class Layout:
 
     def __init__(self, root: Path):
         self.root = root
-        self.data = root / "TugBoat"
+        self.data = root / ".TugBoat"
         self.state = self.data / "state"
         self.cache = self.data / "cache"
         self.bin = self.data / "bin"
         self.cron_entry = self.bin / "cron.entry"
         self.fixes = self.bin / "fixes.sh"
         self.config = self.data / "TugBoat.conf"
-        self.old_config = root / "TugBoat.conf"
+        self.old_configs = (root / "TugBoat" / "TugBoat.conf", root / "TugBoat.conf")
 
 
 LAYOUT = Layout(SCRIPT_DIR)
@@ -132,7 +133,7 @@ CONFIG_FILE = LAYOUT.config
 
 
 def config_source() -> Path:
-    return CONFIG_FILE if CONFIG_FILE.is_file() or not LAYOUT.old_config.is_file() else LAYOUT.old_config
+    return next((path for path in (CONFIG_FILE, *LAYOUT.old_configs) if path.is_file()), CONFIG_FILE)
 
 
 def ensure_parent(path: Path) -> Path:
@@ -428,7 +429,28 @@ UPDATED_ENV = "TUGBOAT_JUST_UPDATED"
 
 
 FIXES_RETRY_SECONDS = 3600
-SHIPPED_FILES = ("TugBoat/bin/cron.entry", "TugBoat/bin/fixes.sh")
+SHIPPED_FILES = (".TugBoat/bin/cron.entry", ".TugBoat/bin/fixes.sh")
+
+
+def fetch_fixes() -> None:
+    marker = LAYOUT.state / "fixes.fetch-failed"
+    try:
+        if LAYOUT.fixes.exists() or time.time() - marker.stat().st_mtime < FIXES_RETRY_SECONDS:
+            return
+    except OSError:
+        pass
+    for tag in (__version__, "main"):
+        try:
+            data = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{tag}/{SHIPPED_FILES[1]}", 10)
+            if data.strip():
+                ensure_parent(LAYOUT.fixes).write_bytes(data)
+                return
+        except (URLError, OSError, HTTPException):
+            continue
+    try:
+        ensure_parent(marker).write_text(now_iso() + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def run_fixes(verbose: bool, force: bool = False) -> bool | None:
@@ -598,7 +620,7 @@ def install_release(rel: dict, dry_run: bool) -> bool:
             pass
 
     try:
-        example = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/TugBoat/TugBoat.conf", 10).decode("utf-8")
+        example = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/.TugBoat/TugBoat.conf", 10).decode("utf-8")
         local = (set(_conf_keys(CONFIG_FILE.read_text(encoding="utf-8")))
                  if CONFIG_FILE.is_file() else set())
         new_keys = [k for k in _conf_keys(example) if k not in local]
@@ -2383,6 +2405,26 @@ def image_icon_names(image: str, entry: dict) -> list[str]:
     return icon_names(*repo[-1:], *repo[-2:-1], *entry.get("names", []))
 
 
+def first_service(stack: Path) -> str:
+    for name in COMPOSE_FILES:
+        try:
+            lines = (stack / name).read_text(encoding="utf-8-sig").splitlines()
+        except OSError:
+            continue
+        inside = False
+        for line in lines:
+            text = _strip_comment(line).rstrip()
+            if not text.strip():
+                continue
+            if not text[0].isspace():
+                inside = text.split(":")[0].strip() == "services"
+            elif inside:
+                match = re.match(r"""^\s+["']?([\w.-]+)["']?\s*:""", text)
+                return match.group(1) if match else ""
+        return ""
+    return ""
+
+
 def declared_images(stack: Path, containers: list[dict]) -> dict[str, dict]:
     found: dict[str, dict] = {}
 
@@ -2447,6 +2489,7 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
         write("\r\033[K")
 
     result: dict[str, dict] = {}
+    paths = {stack.name: stack for stack in stacks}
     for name, (declared, in_use) in gathered.items():
         images = []
         for image, entry in sorted(declared.items()):
@@ -2462,11 +2505,8 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
                                                 "local_release_date", "remote_release_date",
                                                 "local_digest", "remote_digest", "source_url", "icon", "icon_url",
                                                 "detail")})
-        stack_icon = dict(NO_ICON)
-        if ICONS:
-            stack_icon = ICONS.lookup("", icon_names(name), db.stack(name) if db else {})
-            if not stack_icon["icon"]:
-                stack_icon = next(({k: i[k] for k in NO_ICON} for i in images if i["icon"]), stack_icon)
+        first = first_service(paths[name]) or min((s for i in images for s in i["services"]), default="")
+        stack_icon = next(({k: i[k] for k in NO_ICON} for i in images if first in i["services"]), dict(NO_ICON))
         result[name] = {
             "images": images,
             "updates_available": sum(i["status"] in IMAGE_OUTDATED for i in images),
@@ -3604,7 +3644,7 @@ def main() -> int:
                            "minutes (TugBoat also keeps it in line on every run, see manage_cron)")
     mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job")
     mode.add_argument("--run-fixes", action="store_true",
-                      help="run TugBoat/bin/fixes.sh now (it also runs by itself whenever it changes)")
+                      help="run .TugBoat/bin/fixes.sh now (it also runs by itself whenever it changes)")
     mode.add_argument("--check-update", action="store_true",
                       help="check GitHub for a newer TugBoat release")
     mode.add_argument("--self-update", action="store_true",
@@ -3667,6 +3707,7 @@ def main() -> int:
         if user_warning:
             say(yellow(f"{SYM['warn']} {user_warning}"))
         if not args.dry_run:
+            fetch_fixes()
             fixed = run_fixes(args.verbose, force=args.run_fixes)
             if fixed is False:
                 say(yellow(f"{SYM['warn']} {LAYOUT.fixes.name} failed - see above; "

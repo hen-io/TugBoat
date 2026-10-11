@@ -89,16 +89,18 @@ python3 "$TMP/TugBoat.py" --version >/dev/null 2>&1 || fail "the downloaded TugB
 
 mkdir -p "$DIR"
 SCRIPT="$DIR/TugBoat.py"
-CONF="$DIR/TugBoat/TugBoat.conf"
-mkdir -p "$DIR/TugBoat"
-if [ ! -f "$CONF" ] && [ -f "$DIR/TugBoat.conf" ]; then
-    mv "$DIR/TugBoat.conf" "$CONF"
-    say "Moved your config to $CONF"
-fi
+CONF="$DIR/.TugBoat/TugBoat.conf"
+mkdir -p "$DIR/.TugBoat"
+for old in "$DIR/TugBoat/TugBoat.conf" "$DIR/TugBoat.conf"; do
+    if [ ! -f "$CONF" ] && [ -f "$old" ]; then
+        mv "$old" "$CONF"
+        say "Moved your config to $CONF"
+    fi
+done
 
 if [ -f "$SCRIPT" ]; then
-    mkdir -p "$DIR/TugBoat/state"
-    cp -p "$SCRIPT" "$DIR/TugBoat/state/script-previous.bak"
+    mkdir -p "$DIR/.TugBoat/state"
+    cp -p "$SCRIPT" "$DIR/.TugBoat/state/script-previous.bak"
 fi
 cp "$TMP/TugBoat.py" "$SCRIPT.new"
 chmod 755 "$SCRIPT.new"
@@ -114,7 +116,7 @@ if [ -f "$CONF" ]; then
         say "docker_user set to $DOCKER_USER"
     fi
 else
-    fetch "$RAW/TugBoat/TugBoat.conf" "$CONF" || fail "could not download TugBoat.conf"
+    fetch "$RAW/.TugBoat/TugBoat.conf" "$CONF" || fail "could not download TugBoat.conf"
     chmod 644 "$CONF"
     if [ -z "$DOCKER_USER" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
         DOCKER_USER="$SUDO_USER"
@@ -129,9 +131,9 @@ else
     say "Created $CONF"
 fi
 
-mkdir -p "$DIR/TugBoat/bin"
+mkdir -p "$DIR/.TugBoat/bin"
 for file in cron.entry fixes.sh; do
-    fetch "$RAW/TugBoat/bin/$file" "$TMP/$file" && [ -s "$TMP/$file" ] && cp "$TMP/$file" "$DIR/TugBoat/bin/$file"
+    fetch "$RAW/.TugBoat/bin/$file" "$TMP/$file" && [ -s "$TMP/$file" ] && cp "$TMP/$file" "$DIR/.TugBoat/bin/$file"
 done
 
 if [ -d "$(dirname "$LINK")" ]; then
