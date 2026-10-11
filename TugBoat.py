@@ -33,7 +33,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 __title__ = "TugBoat"
-__version__ = "0.7.4"
+__version__ = "0.7.5"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -1557,6 +1557,7 @@ def ask_for_action() -> str | None:
     _menu_item("4", "Health check")
     _menu_item("5", f"Restart  {dim('stop → start, no pull' if UNICODE else 'stop, start, no pull')}")
     _menu_item("6", f"Rollback  {dim('restore a backup of one stack')}")
+    _menu_item("7", f"Remove  {dim('docker compose down: removes the containers, keeps the files')}")
     _menu_item("q", dim("Quit"))
     while True:
         answer = _prompt()
@@ -1574,6 +1575,8 @@ def ask_for_action() -> str | None:
             return "restart"
         if answer in ("6", "rollback"):
             return "rollback"
+        if answer in ("7", "remove"):
+            return "remove"
         say(yellow("  Invalid choice, try again."))
 
 
@@ -1602,7 +1605,7 @@ def ask_for_stacks(stacks: list[Path], action: str, snaps: dict[str, dict] | Non
         if idx is None:
             say(yellow("  Invalid selection, try again."))
             continue
-        if action in ("stop", "restart") and len(idx) == len(stacks) and len(stacks) > 1:
+        if action in ("stop", "restart", "remove") and len(idx) == len(stacks) and len(stacks) > 1:
             confirm = _prompt(f"{action.capitalize()} ALL {len(stacks)} stacks? [y/N] ")
             if confirm not in ("y", "yes"):
                 say(yellow("  Cancelled - select again or 'q' to quit."))
@@ -2800,6 +2803,7 @@ def _fail(res: StackResult, step: str, out: StepOutcome, status: str) -> StackRe
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 COMPOSE_CREATE = "docker compose up -d --pull missing"
 UPDATE_CMD = "docker compose pull && docker compose up -d --remove-orphans"
+COMPOSE_REMOVE = "docker compose down --remove-orphans"
 STOP_DRY = "would stop each running container with: docker container stop <name>"
 OLD_CONTAINERS_DRY = "would remove containers from outside the stack that use the same names"
 START_DRY = ("would start each stopped container with: docker container start <name>, and create "
@@ -2987,6 +2991,19 @@ def stop_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed")
     res.status = "stopped"
+    return res
+
+
+def remove_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
+    res = StackResult(stack.name)
+    if ui.dry_run:
+        ui.dry("Remove", f"would run: {COMPOSE_REMOVE}")
+        res.status = "would remove"
+        return res
+    out = ui.step("Remove", command_work(COMPOSE_REMOVE, stack), timeout=cfg.command_timeout)
+    if not out.ok:
+        return _fail(res, "Remove", out, "remove failed")
+    res.status = "removed"
     return res
 
 
@@ -3423,7 +3440,7 @@ def step_delay(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
 
 def step_stack(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
     action, _, target = value.partition(" ")
-    actions = {"stop": stop_stack, "start": start_stack, "restart": restart_stack,
+    actions = {"stop": stop_stack, "start": start_stack, "restart": restart_stack, "remove": remove_stack,
                "update": lambda stack, cfg, ui: update_stack(stack, cfg, cfg.backup, ui)}
     targets = run.stacks if target.strip().lower() == "all" else [
         s for s in run.stacks if s.name.lower() == target.strip().lower()]
@@ -3508,7 +3525,7 @@ def due_error_actions(selected: list[Path], db: StatusDB) -> list[tuple[Path, Er
             continue
         rule_ = next((r for r in rules if entry.get("health") in r.triggers and r.steps), None)
         last_action = entry.get("last_action") or {}
-        stopped_on_purpose = (entry.get("health") == "stopped" and last_action.get("action") == "stop"
+        stopped_on_purpose = (entry.get("health") == "stopped" and last_action.get("action") in ("stop", "remove")
                               and last_action.get("ok"))
         if rule_ is None or stopped_on_purpose:
             continue
@@ -3630,6 +3647,8 @@ def main() -> int:
                       help="stop -> backup -> pull -> start -> health check")
     mode.add_argument("--start", nargs="*", metavar="STACK", help="start the stack's containers; a missing container is created, and its image pulled only if the host does not have it")
     mode.add_argument("--stop", nargs="*", metavar="STACK", help="stop the stack's containers (they are kept)")
+    mode.add_argument("--remove", nargs="*", metavar="STACK",
+                      help=f"remove the stack's containers ({COMPOSE_REMOVE}); files and volumes stay")
     mode.add_argument("--restart", nargs="*", metavar="STACK",
                       help="stop -> start -> health check, without pulling new images")
     mode.add_argument("--rollback", nargs="*", metavar="STACK",
@@ -3777,7 +3796,7 @@ def main() -> int:
             return 2
         return run_list_backups(chosen, cfg)
 
-    for a in ("update", "start", "stop", "restart", "rollback", "healthcheck"):
+    for a in ("update", "start", "stop", "restart", "remove", "rollback", "healthcheck"):
         value = getattr(args, a)
         if value is not None:
             action = a
@@ -3813,7 +3832,7 @@ def main() -> int:
         except ValueError as e:
             say_error(str(e))
             return 2
-    elif args.all or args.auto or action == "healthcheck":
+    elif args.all or args.auto or action == "healthcheck" or len(stacks) == 1:
         selected = stacks
     else:
         selected = ask_for_stacks(stacks, action, snaps, db)
@@ -3941,6 +3960,8 @@ def main() -> int:
                 res = stop_stack(stack, cfg, runner)
             elif action == "start":
                 res = start_stack(stack, cfg, runner)
+            elif action == "remove":
+                res = remove_stack(stack, cfg, runner)
             elif action == "restart":
                 res = restart_stack(stack, cfg, runner)
             elif action == "rollback":
