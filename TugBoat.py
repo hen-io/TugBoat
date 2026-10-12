@@ -31,7 +31,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
-
 __title__ = "TugBoat"
 __version__ = "0.7.5"
 __author__ = "Henrik Isefjær Olsen"
