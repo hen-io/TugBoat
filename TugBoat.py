@@ -845,7 +845,7 @@ def load_defaults_state(path: Path) -> dict[str, str] | None:
 
 def save_defaults_state(path: Path) -> None:
     target = defaults_state_path(path)
-    tmp = target.with_name(target.name + ".new")
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.new")
     try:
         ensure_parent(tmp).write_text(json.dumps(CONFIG_DEFAULTS, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, target)
@@ -915,7 +915,7 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[tuple[s
         out += newline
     out += "".join(config_entry(key, config_default(key, raw), newline) for key in missing)
     if write:
-        tmp = path.with_name(f".{path.name}.new")
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
         try:
             if exists:
                 ensure_parent(LAYOUT.state / "config.bak").write_bytes(text.encode("utf-8"))
@@ -1069,13 +1069,35 @@ def dependency_present(name: str) -> bool:
         return False
 
 
+DEPS_OK = LAYOUT.state / "deps.ok"
+QUIET_RECHECK_SECONDS = 300
+
+
+def recently(marker: Path, seconds: float, content: str = "") -> bool:
+    try:
+        return time.time() - marker.stat().st_mtime < seconds and (
+            not content or marker.read_text(encoding="utf-8") == content)
+    except OSError:
+        return False
+
+
+def mark(marker: Path, content: str = "") -> None:
+    try:
+        ensure_parent(marker).write_text(content, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def missing_dependencies(need_docker: bool, need_cron: bool) -> list[str]:
     missing: list[str] = []
     if need_docker:
         if not dependency_present("docker"):
             missing += ["docker", "compose"]
-        elif not dependency_present("compose"):
-            missing.append("compose")
+        elif not recently(DEPS_OK, QUIET_RECHECK_SECONDS):
+            if dependency_present("compose"):
+                mark(DEPS_OK)
+            else:
+                missing.append("compose")
     if need_cron and not dependency_present("cron"):
         missing.append("cron")
     return missing
@@ -1398,20 +1420,29 @@ def plan_cron(current: str, entry: list[str] | str | None) -> tuple[str, str]:
     return ("\n".join(result) + "\n" if result else ""), old
 
 
-def ensure_cron(cfg: Config, dry_run: bool) -> tuple[str, str]:
+CRON_CHECKED = LAYOUT.state / "cron.checked"
+
+
+def ensure_cron(cfg: Config, dry_run: bool, quick: bool = False) -> tuple[str, str]:
     try:
         block = cron_block(cfg)
     except ValueError as e:
         return "error", str(e)
+    wanted = "\n".join(block)
+    if quick and recently(CRON_CHECKED, QUIET_RECHECK_SECONDS, wanted):
+        return "same", ""
     if shutil.which("crontab") is None:
         return "error", "crontab not found - install cron first (Debian/Ubuntu: apt install cron)"
     try:
         current = read_crontab()
         updated, old = plan_cron(current, block)
         if updated.rstrip("\n") == current.rstrip("\n"):
+            if not dry_run:
+                mark(CRON_CHECKED, wanted)
             return "same", ""
         if not dry_run:
             apply_crontab(current, updated)
+            mark(CRON_CHECKED, wanted)
     except RuntimeError as e:
         return "error", f"could not update the crontab: {e}"
     return ("updated" if old else "added"), old or ""
@@ -1759,6 +1790,13 @@ def age_seconds(iso: object) -> float | None:
         return None
 
 
+def newer(a: object, b: object) -> bool:
+    try:
+        return datetime.fromisoformat(str(a)) > datetime.fromisoformat(str(b))
+    except (ValueError, TypeError):
+        return False
+
+
 def is_fresh(iso: object, max_age: float) -> bool:
     age = age_seconds(iso)
     return age is not None and 0 <= age < max_age
@@ -1838,9 +1876,7 @@ def check_health(stack: Path) -> dict:
     if containers is None:
         return {"health": "unknown", "summary": "could not read status", "problems": [err],
                 "containers": [], "checked_at": now_iso()}
-    health, summary, problems = summarize_health(containers)
-    return {"health": health, "summary": summary, "problems": problems,
-            "containers": containers, "checked_at": now_iso()}
+    return snapshot(containers)
 
 
 def problem_logs(stack: Path, snapshot: dict, tail: int = 15) -> list[str]:
@@ -2544,7 +2580,23 @@ def print_image_report(stacks: list[Path], images: dict[str, dict]) -> None:
         say("\n  " + green(f"{SYM['ok']} All {len(rows)} image(s) are up to date"))
 
 
+@contextmanager
+def file_lock(path: Path, shared: bool = False):
+    try:
+        handle = open(ensure_parent(path), "ab")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
+
+
 class StatusDB:
+
+    HEALTH_KEYS = ("health", "summary", "problems", "checked_at", "containers")
 
     def __init__(self, path: Path):
         self.path = path
@@ -2552,7 +2604,8 @@ class StatusDB:
         self.written_by = self.data.get("tugboat_version")
         self._changes: dict[str, dict] = {}
         self._top: dict = {}
-        self._known: set[str] | None = None
+        self._drop: set[str] = set()
+        self._lock = threading.Lock()
 
     def _load(self, warn: bool) -> dict:
         try:
@@ -2599,8 +2652,11 @@ class StatusDB:
         self.data[key] = value
         self._top[key] = value
 
-    def set_health(self, name: str, snapshot: dict) -> None:
-        self._set(name, {k: snapshot[k] for k in ("health", "summary", "problems", "checked_at", "containers")})
+    def set_health(self, name: str, snapshot: dict, path: Path | None = None) -> None:
+        values = {k: snapshot[k] for k in self.HEALTH_KEYS}
+        if path is not None:
+            values["path"] = str(path)
+        self._set(name, values)
 
     def set_images(self, name: str, images: dict) -> None:
         keys = ("images", "updates_available", "images_checked_at", "icon", "icon_url")
@@ -2625,20 +2681,31 @@ class StatusDB:
             values["last_update"] = now_iso()
         self._set(res.name, values)
 
+    @staticmethod
+    def gone(entry: object) -> bool:
+        path = Path(entry["path"]) if isinstance(entry, dict) and entry.get("path") else None
+        return path is None or (path.parent.is_dir() and not path.is_dir())
+
     def forget_missing(self, existing: list[Path]) -> None:
-        self._known = {s.name for s in existing}
-        for name in list(self.data["stacks"]):
-            if name not in self._known:
-                del self.data["stacks"][name]
+        known = {s.name for s in existing}
+        self._drop = {n for n, e in self.data["stacks"].items() if n not in known and self.gone(e)}
+        for name in self._drop:
+            del self.data["stacks"][name]
 
     def save(self) -> None:
+        with self._lock, file_lock(self.path.with_name(f".{self.path.name}.lock")):
+            self._save()
+
+    def _save(self) -> None:
         data = self._load(warn=False)
         for name, values in self._changes.items():
             if not isinstance(data["stacks"].get(name), dict):
                 data["stacks"][name] = {}
-            data["stacks"][name].update(values)
-        stacks = {n: e for n, e in data["stacks"].items()
-                  if isinstance(e, dict) and (self._known is None or n in self._known)}
+            entry = data["stacks"][name]
+            if "checked_at" in values and newer(entry.get("checked_at"), values["checked_at"]):
+                values = {k: v for k, v in values.items() if k not in self.HEALTH_KEYS}
+            entry.update(values)
+        stacks = {n: e for n, e in data["stacks"].items() if isinstance(e, dict) and n not in self._drop}
         data["stacks"] = dict(sorted(stacks.items(), key=lambda kv: kv[0].lower()))
         summary: dict[str, int] = {"stacks": len(stacks)}
         for entry in stacks.values():
@@ -2670,14 +2737,73 @@ HEALTH_STYLE = {
 }
 
 
+PS_FORMAT = "\t".join((
+    "{{.Names}}", "{{.State}}", "{{.Status}}", "{{.Image}}", '{{.Label "com.docker.compose.project"}}',
+    '{{.Label "com.docker.compose.service"}}', '{{.Label "com.docker.compose.project.working_dir"}}'))
+HEALTH_IN_STATUS_RE = re.compile(r"\((healthy|unhealthy|health: starting)\)")
+EXIT_IN_STATUS_RE = re.compile(r"^Exited \((-?\d+)\)")
+
+
+def compose_project_name(folder: str) -> str:
+    return re.sub(r"[^a-z0-9_-]", "", folder.lower())
+
+
+def all_compose_containers() -> list[dict] | None:
+    rc, out, _ = docker(["ps", "--all", "--no-trunc", "--filter", "label=com.docker.compose.project",
+                         "--format", PS_FORMAT])
+    if rc != 0:
+        return None
+    found = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        name, state, status, image, project, service, workdir = parts
+        health = HEALTH_IN_STATUS_RE.search(status)
+        exit_code = EXIT_IN_STATUS_RE.match(status)
+        found.append({"name": name.split(",")[0], "service": service, "state": state.lower(),
+                      "health": (health.group(1).replace("health: ", "") if health else ""),
+                      "exit_code": int(exit_code.group(1)) if exit_code else (0 if state != "exited" else None),
+                      "image": image, "status": status, "_project": project, "_workdir": workdir})
+    return found
+
+
+def group_by_stack(stacks: list[Path], containers: list[dict]) -> dict[str, list[dict]]:
+    by_dir: dict[str, list[dict]] = {}
+    by_project: dict[str, list[dict]] = {}
+    for c in containers:
+        if c["_workdir"]:
+            by_dir.setdefault(os.path.realpath(c["_workdir"]), []).append(c)
+        by_project.setdefault(c["_project"], []).append(c)
+    grouped = {}
+    for stack in stacks:
+        found = by_dir.get(os.path.realpath(stack)) or [
+            c for c in by_project.get(compose_project_name(stack.name), []) if not c["_workdir"]
+            or not os.path.isdir(c["_workdir"])]
+        grouped[stack.name] = sorted(({k: v for k, v in c.items() if not k.startswith("_")} for c in found),
+                                     key=lambda c: c["name"])
+    return grouped
+
+
+def snapshot(containers: list[dict]) -> dict:
+    health, summary, problems = summarize_health(containers)
+    return {"health": health, "summary": summary, "problems": problems,
+            "containers": containers, "checked_at": now_iso()}
+
+
 def check_all(stacks: list[Path]) -> dict[str, dict]:
     if IS_TTY:
         write(f"  {cyan(SPINNER[0])} {dim(f'Checking {len(stacks)} stack(s)...')}")
-    with ThreadPoolExecutor(max_workers=min(8, len(stacks) or 1)) as pool:
-        snaps = dict(zip((s.name for s in stacks), pool.map(check_health, stacks)))
+    containers = all_compose_containers()
+    grouped = group_by_stack(stacks, containers) if containers is not None else {}
+    snaps = {name: snapshot(found) for name, found in grouped.items() if found}
+    rest = [s for s in stacks if s.name not in snaps]
+    if rest:
+        with ThreadPoolExecutor(max_workers=min(8, len(rest))) as pool:
+            snaps.update(zip((s.name for s in rest), pool.map(check_health, rest)))
     if IS_TTY:
         write("\r\033[K")
-    return snaps
+    return {s.name: snaps[s.name] for s in stacks}
 
 
 def fmt_age(seconds: float) -> str:
@@ -2733,8 +2859,8 @@ def show_overview(stacks: list[Path], db: StatusDB | None) -> dict[str, dict]:
     print_health_table(stacks, snaps, db)
     say("\n  " + dim(" · ").join(parts))
     if db:
-        for name, snap in snaps.items():
-            db.set_health(name, snap)
+        for stack in stacks:
+            db.set_health(stack.name, snaps[stack.name], stack)
         try:
             db.save()
         except OSError:
@@ -2762,8 +2888,8 @@ def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool
     print_health_table(selected, snaps, db, images)
     bad = [(s.name, snaps[s.name]) for s in selected if snaps[s.name]["problems"]]
     if db:
-        for name, snap in snaps.items():
-            db.set_health(name, snap)
+        for stack in selected:
+            db.set_health(stack.name, snaps[stack.name], stack)
         for name, found in checked.items():
             db.set_images(name, found)
 
@@ -3773,7 +3899,7 @@ def main() -> int:
             for found_stack in stacks:
                 ensure_stack_file(found_stack)
         if cfg.manage_cron and not args.dry_run:
-            state, old = ensure_cron(cfg, False)
+            state, old = ensure_cron(cfg, False, quick=args.healthcheck is not None)
             if state != "same":
                 say(describe_cron(cfg, state, old))
     except (OSError, ValueError) as e:
@@ -3949,26 +4075,23 @@ def main() -> int:
             say("\n" + green(f"{SYM['ok']} Nothing to update.") + "\n")
             return 0
 
+    jobs: dict[str, Callable[[Path, Runner], StackResult]] = {
+        "stop": lambda stack, runner: stop_stack(stack, cfg, runner),
+        "start": lambda stack, runner: start_stack(stack, cfg, runner),
+        "remove": lambda stack, runner: remove_stack(stack, cfg, runner),
+        "restart": lambda stack, runner: restart_stack(stack, cfg, runner),
+        "rollback": lambda stack, runner: rollback_stack(stack, cfg, rollback_to, not args.skip_backup, runner),
+        "update": lambda stack, runner: update_stack(stack, cfg, do_backup, runner),
+    }
+
     def run_one(stack: Path, runner: Runner) -> StackResult:
         begun = time.monotonic()
         with stack_job(stack, None if args.dry_run else STACK_LOCK_WAIT, runner) as free:
-            if not free:
+            if free:
+                res = jobs[action](stack, runner)
+            else:
                 res = StackResult(stack.name, ok=False, status="another job is still running on this stack")
                 res.errors.append(Issue(stack.name, "-", res.status))
-            elif action == "stop":
-                res = stop_stack(stack, cfg, runner)
-            elif action == "start":
-                res = start_stack(stack, cfg, runner)
-            elif action == "remove":
-                res = remove_stack(stack, cfg, runner)
-            elif action == "restart":
-                res = restart_stack(stack, cfg, runner)
-            elif action == "rollback":
-                res = rollback_stack(stack, cfg, rollback_to, not args.skip_backup, runner)
-            elif action == "update":
-                res = update_stack(stack, cfg, do_backup, runner)
-            else:
-                raise ValueError(f"unknown action '{action}'")
         res.seconds = time.monotonic() - begun
         return res
 
@@ -3977,7 +4100,7 @@ def main() -> int:
             return False
         try:
             snap = res.health or check_health(stack)
-            db.set_health(stack.name, snap)
+            db.set_health(stack.name, snap, stack)
             db.set_action(res, action)
             if action == "update" and res.ok and (image_check or args.only_outdated) and not CANCEL.is_set():
                 db.set_images(stack.name, check_images([stack], {stack.name: snap}, quiet=True, db=db)[stack.name])
