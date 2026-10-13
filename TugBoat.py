@@ -32,7 +32,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.7.9"
+__version__ = "0.7.10"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -2482,6 +2482,25 @@ class IconStore:
 
 
 ICONS: IconStore | None = None
+STACK_LOGOS = ("logo.png", "logo.svg", "logo.webp", "logo.jpg")
+
+
+def stack_logo(stack: Path, base: Path) -> dict | None:
+    source = next((stack / name for name in STACK_LOGOS if (stack / name).is_file()), None)
+    if source is None:
+        return None
+    target = LAYOUT.cache / "icons" / f"stack-{re.sub(r'[^A-Za-z0-9._-]', '_', stack.name)}{source.suffix.lower()}"
+    try:
+        st = source.stat()
+        if not (target.is_file() and target.stat().st_size == st.st_size and target.stat().st_mtime >= st.st_mtime):
+            shutil.copyfile(source, ensure_parent(target).with_name(target.name + ".new"))
+            os.replace(target.with_name(target.name + ".new"), target)
+            for old in target.parent.glob(f"{target.stem}.*"):
+                if old != target and old.suffix != ".new":
+                    old.unlink(missing_ok=True)
+    except OSError:
+        return None
+    return {"icon": os.path.relpath(target, base), "icon_url": "", "icon_source": "logo"}
 
 
 def image_icon_names(image: str, entry: dict) -> list[str]:
@@ -2592,6 +2611,7 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
                                                 "detail")})
         first = first_service(paths[name]) or min((s for i in images for s in i["services"]), default="")
         stack_icon = next(({k: i[k] for k in NO_ICON} for i in images if first in i["services"]), dict(NO_ICON))
+        stack_icon = stack_logo(paths[name], db.path.parent if db else LAYOUT.data) or stack_icon
         result[name] = {
             "images": images,
             "updates_available": sum(i["status"] in IMAGE_OUTDATED for i in images),
@@ -2706,8 +2726,11 @@ class StatusDB:
         self._set(name, values)
 
     def set_images(self, name: str, images: dict) -> None:
-        keys = ("images", "updates_available", "images_checked_at", "icon", "icon_url")
+        keys = ("images", "updates_available", "images_checked_at", "icon", "icon_url", "icon_source")
         self._set(name, {k: images[k] for k in keys if k in images})
+
+    def set_icon(self, name: str, icon: dict) -> None:
+        self._set(name, icon)
 
     def set_error_action(self, name: str, record: dict) -> None:
         self._set(name, {"error_action": record})
@@ -2932,6 +2955,10 @@ def run_healthcheck(selected: list[Path], db: StatusDB | None, image_check: bool
     if db:
         for stack in selected:
             db.set_health(stack.name, snaps[stack.name], stack)
+        for stack in selected:
+            logo = stack_logo(stack, db.path.parent)
+            if logo and logo["icon"] != db.stack(stack.name).get("icon"):
+                db.set_icon(stack.name, logo)
         for name, found in checked.items():
             db.set_images(name, found)
 
