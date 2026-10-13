@@ -32,7 +32,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.7.6"
+__version__ = "0.7.7"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -60,7 +60,7 @@ CONFIG_DEFAULTS = {
     "parallel_stacks": "4",
     "error_actions": "true",
     "update_check": "true",
-    "update_check_interval": "60",
+    "update_check_seconds": "1800",
     "auto_update": "true",
 }
 CONFIG_HELP = {
@@ -88,7 +88,7 @@ CONFIG_HELP = {
     "parallel_stacks": "Stacks handled at the same time by update, start, stop and restart (1 = one by one)",
     "error_actions": "Run the error actions from each stack's TugBoat.stack file during the health check",
     "update_check": "Look for a new TugBoat release",
-    "update_check_interval": "Minutes between checks for a new TugBoat release",
+    "update_check_seconds": "Seconds between checks for a new TugBoat release (checked when TugBoat starts)",
     "auto_update": "Install new TugBoat releases automatically",
 }
 CONFIG_GROUPS = (
@@ -98,7 +98,7 @@ CONFIG_GROUPS = (
     ("image_check", "image_check_interval", "registry_timeout"),
     ("icons", "icon_index_days"),
     ("manage_cron", "healthcheck_interval", "install_dependencies"),
-    ("update_check", "update_check_interval", "auto_update"),
+    ("update_check", "update_check_seconds", "auto_update"),
 )
 PREVIOUS_DEFAULTS = {
     "backup_retention": ["10"],
@@ -681,7 +681,7 @@ def startup_update_check(cfg: "Config", dry_run: bool, db: "StatusDB | None") ->
             say(green(f"{SYM['ok']} Updated to {__title__} {__version__}"))
         return
     cached = db.data.get("release_check") if db else None
-    if isinstance(cached, dict) and is_fresh(cached.get("checked_at"), cfg.update_check_interval * 60):
+    if isinstance(cached, dict) and is_fresh(cached.get("checked_at"), cfg.update_check_seconds):
         latest = str(cached.get("latest") or "")
         if parse_version(latest) > parse_version(__version__):
             say(yellow(f"{SYM['warn']} {__title__} {latest} is available (you have {__version__}) - "
@@ -728,7 +728,7 @@ class Config:
     command_timeout: int
     manage_cron: bool
     healthcheck_interval: int
-    update_check_interval: int
+    update_check_seconds: int
     registry_timeout: int
     install_dependencies: bool
     icons: bool
@@ -982,7 +982,7 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         command_timeout=_parse_int(get("command_timeout"), "command_timeout"),
         manage_cron=_parse_bool(get("manage_cron"), "manage_cron"),
         healthcheck_interval=_parse_int(get("healthcheck_interval"), "healthcheck_interval"),
-        update_check_interval=_parse_int(get("update_check_interval"), "update_check_interval"),
+        update_check_seconds=_parse_int(get("update_check_seconds"), "update_check_seconds"),
         registry_timeout=max(1, _parse_int(get("registry_timeout"), "registry_timeout")),
         install_dependencies=_parse_bool(get("install_dependencies"), "install_dependencies"),
         icons=_parse_bool(get("icons"), "icons"),
@@ -2686,9 +2686,10 @@ class StatusDB:
         path = Path(entry["path"]) if isinstance(entry, dict) and entry.get("path") else None
         return path is None or (path.parent.is_dir() and not path.is_dir())
 
-    def forget_missing(self, existing: list[Path]) -> None:
+    def forget_missing(self, existing: list[Path], ignored: set[str] = frozenset()) -> None:
         known = {s.name for s in existing}
-        self._drop = {n for n, e in self.data["stacks"].items() if n not in known and self.gone(e)}
+        self._drop = {n for n, e in self.data["stacks"].items()
+                      if n not in known and (n in ignored or self.gone(e))}
         for name in self._drop:
             del self.data["stacks"][name]
 
@@ -3941,7 +3942,7 @@ def main() -> int:
         return 2
 
     if db:
-        db.forget_missing(stacks)
+        db.forget_missing(stacks, cfg.ignore_folders)
 
     snaps: dict[str, dict] | None = None
     if action is None:

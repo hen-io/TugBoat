@@ -68,5 +68,5 @@ Settings are in `TugBoat.conf` in the scripts root folder. Missing settings are 
 | `manage_cron` | `true` | Let TugBoat keep its cron job in order |
 | `install_dependencies` | `true` | Install missing Docker, Compose plugin and cron (apt, dnf, pacman) |
 | `healthcheck_interval` | `1` | Minutes between runs of the health check cron job (1-59, or whole hours: 60, 120 ...) |
-| `update_check_interval` | `60` | Minutes between checks for a new TugBoat release |
+| `update_check_seconds` | `1800` | Seconds between checks for a new TugBoat release (checked when TugBoat starts) |
 | `registry_timeout` | `10` | Seconds to wait for an image registry when checking for new images |

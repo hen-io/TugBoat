@@ -151,6 +151,21 @@ elif [ "$BACKUPS" = './TugBoat/backups/$STACK-NAME' ]; then
     conf_set backup_path './.TugBoat/backups/$STACK-NAME'
 fi
 
+MINUTES="$(conf_get update_check_interval)"
+if grep -q '^update_check_interval[ \t]*:' "$WORK"; then
+    if ! grep -q '^update_check_seconds[ \t]*:' "$WORK"; then
+        case "$MINUTES" in
+            ''|60) SECONDS_VALUE=1800 ;;
+            *[!0-9]*) SECONDS_VALUE=1800 ;;
+            *) SECONDS_VALUE=$((MINUTES * 60)) ;;
+        esac
+        sed -i "s/^update_check_interval[ \t]*:.*/update_check_seconds: $SECONDS_VALUE/" "$WORK"
+        sed -i 's/^# Minutes between checks for a new TugBoat release$/# Seconds between checks for a new TugBoat release (checked when TugBoat starts)/' "$WORK"
+    else
+        sed -i '/^update_check_interval[ \t]*:/d' "$WORK"
+    fi
+fi
+
 if cmp -s "$WORK" "$CONF"; then
     rm -f "$WORK"
 else
