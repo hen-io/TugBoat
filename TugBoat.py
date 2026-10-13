@@ -32,7 +32,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.7.7"
+__version__ = "0.7.8"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -2328,12 +2328,20 @@ def icon_names(*names: str) -> list[str]:
         for candidate in (key, short):
             if candidate and candidate not in ICON_GENERIC and candidate not in found:
                 found.append(candidate)
+    for name in list(found):
+        rest = name.split("-", 1)[1] if "-" in name else ""
+        if len(rest) >= 4 and rest not in ICON_GENERIC and rest not in found:
+            found.append(rest)
     return found
+
+
+def squash(name: str) -> str:
+    return name.replace("-", "")
 
 
 class DashboardIcons:
     name = "dashboard-icons"
-    base = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons"
+    base = "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons@main"
 
     def load(self, fetch: Callable[[str, int], bytes]) -> dict:
         tree = json.loads(fetch(f"{self.base}/tree.json", ICON_INDEX_MAX_BYTES))
@@ -2355,7 +2363,26 @@ class DashboardIcons:
         return f"{self.base}/{ext}/{name}.{ext}"
 
 
-ICON_PROVIDERS = (DashboardIcons(),)
+class SelfhstIcons:
+    name = "selfhst-icons"
+    base = "https://cdn.jsdelivr.net/gh/selfhst/icons@main"
+
+    def load(self, fetch: Callable[[str, int], bytes]) -> dict:
+        icons: dict[str, str] = {}
+        aliases: dict[str, str] = {}
+        for item in json.loads(fetch(f"{self.base}/index.json", ICON_INDEX_MAX_BYTES)):
+            ref = str(item.get("Reference") or "")
+            ext = next((e for e in ICON_FORMATS if str(item.get(e.upper()) or "").lower() == "yes"), "")
+            if ref and ext:
+                icons[ref] = ext
+                aliases.setdefault(icon_key(str(item.get("Name") or "")), ref)
+        return {"icons": icons, "aliases": aliases}
+
+    def url(self, name: str, ext: str) -> str:
+        return f"{self.base}/{ext}/{name}.{ext}"
+
+
+ICON_PROVIDERS = (DashboardIcons(), SelfhstIcons())
 
 
 class IconStore:
@@ -2365,6 +2392,7 @@ class IconStore:
         self.max_age = index_days * 86400
         self.providers = providers
         self._indexes: dict[str, dict] = {}
+        self._matchers: dict[str, Callable[[str], str | None]] = {}
 
     def fetch(self, url: str, limit: int) -> bytes:
         with _http_open(url, REGISTRY_TIMEOUT) as r:
@@ -2411,14 +2439,32 @@ class IconStore:
         os.replace(tmp, file)
         return {"icon": self.relative(file), "icon_url": url}
 
-    def find(self, names: list[str]) -> dict:
-        for provider in self.providers:
+    def matcher(self, provider) -> Callable[[str], str | None]:
+        if provider.name not in self._matchers:
             index = self.index(provider)
             icons, aliases = index.get("icons") or {}, index.get("aliases") or {}
-            for name in names:
-                match = name if name in icons else aliases.get(name)
-                if match in icons:
-                    return self.download(provider.url(match, icons[match]), match, icons[match])
+            squashed: dict[str, str] = {}
+            for name in icons:
+                squashed.setdefault(squash(name), name)
+            for alias, name in aliases.items():
+                if name in icons:
+                    squashed.setdefault(squash(alias), name)
+            self._matchers[provider.name] = lambda key: (
+                key if key in icons else aliases.get(key) if aliases.get(key) in icons else squashed.get(squash(key)))
+        return self._matchers[provider.name]
+
+    def find(self, names: list[str]) -> dict:
+        for name in names:
+            for provider in self.providers:
+                match = self.matcher(provider)(name)
+                if not match:
+                    continue
+                first = self.index(provider)["icons"][match]
+                for ext in dict.fromkeys((first, "png")):
+                    try:
+                        return self.download(provider.url(match, ext), match, ext)
+                    except ICON_ERRORS:
+                        continue
         return dict(NO_ICON)
 
     def lookup(self, override: str, names: list[str], prior: dict) -> dict:
