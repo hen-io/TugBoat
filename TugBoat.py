@@ -32,7 +32,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.7.8"
+__version__ = "0.7.9"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -970,7 +970,8 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         backup_retention=_parse_int(get("backup_retention"), "backup_retention"),
         backup_large_mb=_parse_int(get("backup_large_mb"), "backup_large_mb"),
         backup_large_retention=_parse_int(get("backup_large_retention"), "backup_large_retention"),
-        ignore_folders={n.strip().strip("/") for n in config_list(raw, "ignore_folders") if n.strip()},
+        ignore_folders={os.path.basename(n.strip().rstrip("/")).lower() for n in config_list(raw, "ignore_folders")
+                        if n.strip().rstrip("/")},
         require_root=_parse_bool(get("require_root"), "require_root"),
         docker_user=get("docker_user").strip(),
         update_check=_parse_bool(get("update_check"), "update_check"),
@@ -1518,7 +1519,7 @@ def find_stacks(roots: list[Path], ignore: set[str] = frozenset()) -> list[Path]
     found: dict[str, Path] = {}
     for root in dict.fromkeys(r.resolve() for r in existing):
         for d in sorted(root.iterdir()):
-            if not (d.is_dir() and not d.name.startswith(".") and d.name not in ignore
+            if not (d.is_dir() and not d.name.startswith(".") and d.name.lower() not in ignore
                     and d.resolve() != LAYOUT.data.resolve()
                     and any((d / f).is_file() for f in COMPOSE_FILES)):
                 continue
@@ -1557,7 +1558,7 @@ def pick_stacks_by_name(names: list[str], stacks: list[Path], cfg: Config) -> li
         name = raw.strip().strip("/")
         stack = by_name.get(name) or by_lower.get(name.lower())
         if stack is None:
-            if name in cfg.ignore_folders:
+            if name.lower() in cfg.ignore_folders:
                 raise ValueError(f"Stack '{name}' is in ignore_folders in TugBoat.conf")
             if any((root / name).is_dir() for root in cfg.stacks_dirs):
                 raise ValueError(f"'{name}' has no compose file ({', '.join(COMPOSE_FILES)})")
@@ -2650,7 +2651,7 @@ class StatusDB:
         self.written_by = self.data.get("tugboat_version")
         self._changes: dict[str, dict] = {}
         self._top: dict = {}
-        self._drop: set[str] = set()
+        self._known: set[str] | None = None
         self._lock = threading.Lock()
 
     def _load(self, warn: bool) -> dict:
@@ -2727,16 +2728,9 @@ class StatusDB:
             values["last_update"] = now_iso()
         self._set(res.name, values)
 
-    @staticmethod
-    def gone(entry: object) -> bool:
-        path = Path(entry["path"]) if isinstance(entry, dict) and entry.get("path") else None
-        return path is None or (path.parent.is_dir() and not path.is_dir())
-
-    def forget_missing(self, existing: list[Path], ignored: set[str] = frozenset()) -> None:
-        known = {s.name for s in existing}
-        self._drop = {n for n, e in self.data["stacks"].items()
-                      if n not in known and (n in ignored or self.gone(e))}
-        for name in self._drop:
+    def forget_missing(self, existing: list[Path]) -> None:
+        self._known = {s.name for s in existing}
+        for name in [n for n in self.data["stacks"] if n not in self._known]:
             del self.data["stacks"][name]
 
     def save(self) -> None:
@@ -2752,7 +2746,8 @@ class StatusDB:
             if "checked_at" in values and newer(entry.get("checked_at"), values["checked_at"]):
                 values = {k: v for k, v in values.items() if k not in self.HEALTH_KEYS}
             entry.update(values)
-        stacks = {n: e for n, e in data["stacks"].items() if isinstance(e, dict) and n not in self._drop}
+        stacks = {n: e for n, e in data["stacks"].items()
+                  if isinstance(e, dict) and (self._known is None or n in self._known)}
         data["stacks"] = dict(sorted(stacks.items(), key=lambda kv: kv[0].lower()))
         summary: dict[str, int] = {"stacks": len(stacks)}
         for entry in stacks.values():
@@ -3988,7 +3983,7 @@ def main() -> int:
         return 2
 
     if db:
-        db.forget_missing(stacks, cfg.ignore_folders)
+        db.forget_missing(stacks)
 
     snaps: dict[str, dict] | None = None
     if action is None:
