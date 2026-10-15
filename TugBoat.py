@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import difflib
 import fcntl
 import functools
 import grp
@@ -12,6 +13,7 @@ import json
 import os
 import platform
 import pwd
+import queue
 import re
 import shlex
 import shutil
@@ -22,7 +24,7 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http.client import HTTPException
 from pathlib import Path
@@ -33,7 +35,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -51,12 +53,16 @@ CONFIG_DEFAULTS = {
     "file_owner": "1000:1000",
     "health_wait": "60",
     "image_check": "true",
+    "image_prune": "all",
     "image_check_interval": "60",
     "registry_timeout": "10",
     "icons": "true",
     "icon_index_days": "7",
+    "healthcheck_mode": "live",
     "manage_cron": "true",
     "healthcheck_interval": "1",
+    "live_mode": "events",
+    "live_interval": "10",
     "install_dependencies": "true",
     "command_timeout": "0",
     "parallel_stacks": "4",
@@ -66,41 +72,47 @@ CONFIG_DEFAULTS = {
     "auto_update": "true",
 }
 CONFIG_HELP = {
-    "stacks_directory": "More folders that hold stacks, one '- \"path\"' line each "
-                        "(the script folder, ./Stacks, ./stacks and ./Stack are always searched)",
-    "require_root": "Restart with sudo when not run as root",
-    "status_file": "Where the status JSON is written",
-    "ignore_folders": "Stack folder names to leave alone, one '- \"name\"' line each",
-    "backup": "Back up a stack folder before every update",
-    "backup_path": "Where backups go ($STACK-NAME becomes the stack name)",
-    "backup_retention": "Backups to keep per stack (0 = keep all)",
-    "backup_large_mb": "A backup bigger than this many MB counts as large (0 = off)",
-    "backup_large_retention": "Backups to keep for a stack whose newest backup is large",
-    "docker_user": "Run docker commands as this user (empty = the user running TugBoat)",
-    "file_owner": "Owner of the files TugBoat writes (.TugBoat, TugBoat.stack), user:group as names or numbers",
-    "health_wait": "Seconds to wait for containers to become healthy after a start",
-    "image_check": "Check the registries for new image versions during the health check",
-    "image_check_interval": "Minutes between registry checks per stack",
-    "registry_timeout": "Seconds to wait for a registry to answer",
-    "icons": "Find a logo for each stack and image (saved in .TugBoat/cache/icons)",
-    "icon_index_days": "Days between downloads of the icon index",
-    "manage_cron": "Keep the health check cron job in line with this config",
-    "healthcheck_interval": "Minutes between health checks (1-59, or whole hours: 60, 120 ...)",
-    "install_dependencies": "Install missing Docker, Compose plugin and cron (apt, dnf, pacman)",
-    "command_timeout": "Seconds before a stop, start or update command is stopped (0 = no limit)",
-    "parallel_stacks": "Stacks handled at the same time by update, start, stop and restart (1 = one by one)",
-    "error_actions": "Run the error actions from each stack's TugBoat.stack file during the health check",
-    "update_check": "Look for a new TugBoat release",
-    "update_check_seconds": "Seconds between checks for a new TugBoat release (checked when TugBoat starts)",
-    "auto_update": "Install new TugBoat releases automatically",
+    "stacks_directory": "Extra stack folders, one '- \"path\"' per line (the script folder, ./Stacks, ./stacks and "
+                        "./Stack are always searched)",
+    "require_root": "Restart with sudo when not run as root (true/false)",
+    "status_file": "Path of the status JSON file",
+    "ignore_folders": "Stack folders to skip, one '- \"name\"' per line",
+    "backup": "Back up a stack before updating it (true/false)",
+    "backup_path": "Backup folder ($STACK-NAME = the stack's name)",
+    "backup_retention": "Backups to keep per stack (count, 0 = all)",
+    "backup_large_mb": "Size from which a backup counts as large (MB, 0 = off)",
+    "backup_large_retention": "Backups to keep when the newest one is large (count)",
+    "docker_user": "User that runs the docker commands (empty = the user running TugBoat)",
+    "file_owner": "Owner of the files TugBoat writes (user:group, names or IDs)",
+    "health_wait": "Longest wait for containers to become healthy after a start (seconds)",
+    "image_check": "Check the registries for new image versions (true/false)",
+    "image_prune": "After an update, delete: old = the stack's previous images, all = every unused image (docker "
+                   "image prune -a), off = nothing",
+    "image_check_interval": "Time between image and icon checks per stack (minutes)",
+    "registry_timeout": "Longest wait for a registry to answer (seconds)",
+    "icons": "Find logos for stacks and images (true/false)",
+    "icon_index_days": "Time between downloads of the icon index (days)",
+    "healthcheck_mode": "live = the tugboat-live service updates the status file on every container change, no cron "
+                        "job; cron = a cron job (also used when there is no systemd)",
+    "healthcheck_interval": "Time between full health checks (minutes; cron mode: 1-59 or whole hours)",
+    "live_mode": "Live mode: events = react to Docker events, interval = ask Docker every live_interval",
+    "live_interval": "Time between checks when live_mode is interval (seconds, 2 or more)",
+    "manage_cron": "Let TugBoat add, update and remove its cron job (true/false)",
+    "install_dependencies": "Install missing Docker, Compose plugin and cron with apt, dnf or pacman (true/false)",
+    "command_timeout": "Longest run for a stop, start or update command (seconds, 0 = no limit)",
+    "parallel_stacks": "Stacks handled at the same time (count, 1 = one by one)",
+    "error_actions": "Run the error actions in each stack's TugBoat.stack (true/false)",
+    "update_check": "Look for new TugBoat releases (true/false)",
+    "update_check_seconds": "Time between checks for a new TugBoat release (seconds)",
+    "auto_update": "Install new TugBoat releases by itself (true/false)",
 }
 CONFIG_GROUPS = (
     ("stacks_directory", "require_root", "status_file", "ignore_folders"),
     ("backup", "backup_path", "backup_retention", "backup_large_mb", "backup_large_retention"),
     ("docker_user", "file_owner", "health_wait", "command_timeout", "parallel_stacks", "error_actions"),
-    ("image_check", "image_check_interval", "registry_timeout"),
+    ("image_check", "image_check_interval", "registry_timeout", "image_prune"),
     ("icons", "icon_index_days"),
-    ("manage_cron", "healthcheck_interval", "install_dependencies"),
+    ("healthcheck_mode", "healthcheck_interval", "live_mode", "live_interval", "manage_cron", "install_dependencies"),
     ("update_check", "update_check_seconds", "auto_update"),
 )
 PREVIOUS_DEFAULTS = {
@@ -109,11 +121,124 @@ PREVIOUS_DEFAULTS = {
     "backup_large_retention": ["2", "1"],
     "healthcheck_interval": ["5"],
 }
+PREVIOUS_HELP = {
+    "manage_cron": [
+        "Keep the health check cron job in line with this config",
+        "Add, update and remove TugBoat's cron job to match healthcheck_mode",
+        "Let TugBoat add, update and remove its own cron job (removed while healthcheck_mode is live)",
+    ],
+    "healthcheck_interval": [
+        "Minutes between health checks (1-59, or whole hours: 60, 120 ...)",
+        "Minutes between full health checks: image versions, icons, error actions (cron: 1-59, or whole hours: 60, "
+        "120 ...)",
+        "Minutes between full health checks (image versions, icons, error actions); cron mode takes 1-59 or whole "
+        "hours (60, 120 ...)",
+    ],
+    "healthcheck_mode": [
+        "live: the tugboat-live service (systemd, starts at boot) keeps the status file up to date and runs the "
+        "health checks; cron: a cron job runs them (also used when there is no systemd)",
+        "How health checks run. live: the tugboat-live service (starts at boot) updates the status file within "
+        "seconds of any container change and runs the full check every healthcheck_interval minutes, no cron job. "
+        "cron: a cron job runs the full check every healthcheck_interval minutes (used by itself when the host has "
+        "no systemd)",
+    ],
+    "live_mode": [
+        "events: update as soon as Docker reports a change; interval: check every live_interval seconds",
+        "healthcheck_mode live - events: update as soon as Docker reports a change; interval: check every "
+        "live_interval seconds",
+        "Live mode only. events: wait for Docker to report a change, no CPU used while nothing happens. interval: "
+        "ask Docker every live_interval seconds (for hosts where Docker events are unreliable)",
+    ],
+    "live_interval": [
+        "Seconds between checks when live_mode is interval",
+        "Live mode with live_mode: interval only - seconds between checks (2 or more)",
+    ],
+    "stacks_directory": [
+        "More folders that hold stacks, one '- \"path\"' line each (the script folder, ./Stacks, ./stacks and "
+        "./Stack are always searched)",
+    ],
+    "require_root": [
+        "Restart with sudo when not run as root",
+    ],
+    "status_file": [
+        "Where the status JSON is written",
+    ],
+    "ignore_folders": [
+        "Stack folder names to leave alone, one '- \"name\"' line each",
+    ],
+    "backup": [
+        "Back up a stack folder before every update",
+    ],
+    "backup_path": [
+        "Where backups go ($STACK-NAME becomes the stack name)",
+    ],
+    "backup_retention": [
+        "Backups to keep per stack (0 = keep all)",
+    ],
+    "backup_large_mb": [
+        "A backup bigger than this many MB counts as large (0 = off)",
+    ],
+    "backup_large_retention": [
+        "Backups to keep for a stack whose newest backup is large",
+    ],
+    "docker_user": [
+        "Run docker commands as this user (empty = the user running TugBoat)",
+    ],
+    "file_owner": [
+        "Owner of the files TugBoat writes (.TugBoat, TugBoat.stack), user:group as names or numbers",
+    ],
+    "health_wait": [
+        "Seconds to wait for containers to become healthy after a start",
+    ],
+    "image_check": [
+        "Check the registries for new image versions during the health check",
+    ],
+    "image_prune": [
+        "After a successful update - old: delete the images the stack used before, if nothing else uses them; all: "
+        "docker image prune -a -f (every image no container uses, also other projects'); off: keep everything",
+    ],
+    "image_check_interval": [
+        "Minutes between registry checks per stack",
+    ],
+    "registry_timeout": [
+        "Seconds to wait for a registry to answer",
+    ],
+    "icons": [
+        "Find a logo for each stack and image (saved in .TugBoat/cache/icons)",
+    ],
+    "icon_index_days": [
+        "Days between downloads of the icon index",
+    ],
+    "install_dependencies": [
+        "Install missing Docker, Compose plugin and cron (apt, dnf, pacman)",
+    ],
+    "command_timeout": [
+        "Seconds before a stop, start or update command is stopped (0 = no limit)",
+    ],
+    "parallel_stacks": [
+        "Stacks handled at the same time by update, start, stop and restart (1 = one by one)",
+    ],
+    "error_actions": [
+        "Run the error actions from each stack's TugBoat.stack file during the health check",
+    ],
+    "update_check": [
+        "Look for a new TugBoat release",
+    ],
+    "update_check_seconds": [
+        "Seconds between checks for a new TugBoat release (checked when TugBoat starts)",
+    ],
+    "auto_update": [
+        "Install new TugBoat releases automatically",
+    ],
+}
 PINNED_CONFIG_KEYS = ("stacks_directory", "status_file", "backup_path")
 LIST_CONFIG_KEYS = ("stacks_directory", "ignore_folders")
 BUILTIN_STACK_DIRS = (".", "./Stacks", "./stacks", "./Stack")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+LIVE_MODES = ("events", "interval")
+HEALTHCHECK_MODES = ("live", "cron")
+IMAGE_PRUNE_MODES = ("old", "all", "off")
 
 
 class Layout:
@@ -761,6 +886,7 @@ class Config:
     auto_update: bool
     image_check: bool
     image_check_interval: int
+    image_prune: str
     command_timeout: int
     manage_cron: bool
     healthcheck_interval: int
@@ -771,6 +897,9 @@ class Config:
     icon_index_days: int
     parallel_stacks: int
     error_actions: bool
+    healthcheck_mode: str
+    live_mode: str
+    live_interval: int
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -909,6 +1038,29 @@ def save_defaults_state(path: Path) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def help_state_path() -> Path:
+    return LAYOUT.state / "config.help"
+
+
+def load_help_state() -> dict[str, str]:
+    try:
+        data = json.loads(help_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_help_state() -> None:
+    try:
+        ensure_parent(help_state_path()).write_text(json.dumps(CONFIG_HELP, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def old_help(key: str, state: dict[str, str]) -> set[str]:
+    return {*PREVIOUS_HELP.get(key, []), *([state[key]] if isinstance(state.get(key), str) else [])} - {CONFIG_HELP[key]}
+
+
 def replace_config_value(line: str, new: str) -> str:
     ending = line[len(line.rstrip("\r\n")):]
     body = line.rstrip("\r\n")
@@ -936,6 +1088,7 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[tuple[s
     raw = parse_config_text(text, path.name)
     newline = "\r\n" if "\r\n" in text else "\n"
     state = load_defaults_state(path)
+    help_state = load_help_state()
     container = first_stacks_dir(raw)
     present: set[str] = set()
     changed: list[tuple[str, str, str]] = []
@@ -946,8 +1099,12 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[tuple[s
         key = match.group(1).lower() if match else ""
         if key:
             present.add(key)
-        if key in CONFIG_HELP and not (kept and kept[-1].lstrip("\ufeff").lstrip().startswith("#")):
+        above = kept[-1].lstrip("\ufeff").strip() if kept else ""
+        if key in CONFIG_HELP and not above.startswith("#"):
             kept.append(f"# {CONFIG_HELP[key]}{newline}")
+            described = True
+        elif key in CONFIG_HELP and above.lstrip("#").strip() in old_help(key, help_state):
+            kept[-1] = ("\ufeff" if kept[-1].startswith("\ufeff") else "") + f"# {CONFIG_HELP[key]}{newline}"
             described = True
         if (key in CONFIG_DEFAULTS and key in raw and key not in PINNED_CONFIG_KEYS
                 and key not in LIST_CONFIG_KEYS):
@@ -965,6 +1122,8 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[tuple[s
     if not (missing or changed or described or created):
         if write and state != CONFIG_DEFAULTS:
             save_defaults_state(path)
+        if write and help_state != CONFIG_HELP:
+            save_help_state()
         return [], []
     out = "".join(kept)
     if missing and out and not out.endswith(("\n", "\r")):
@@ -990,7 +1149,100 @@ def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[tuple[s
             tmp.unlink(missing_ok=True)
             raise
         save_defaults_state(path)
+        save_help_state()
     return (list(CONFIG_DEFAULTS) if created else missing), changed
+
+
+SCHEDULE_KEYS = ("healthcheck_mode", "healthcheck_interval", "manage_cron")
+
+
+def config_value_text(value: str) -> str:
+    return json.dumps(value) if value != value.strip() or "#" in value or value[:1] in "\"'" and value else value
+
+
+def set_config_value(path: Path, key: str, values: list[str]) -> tuple[str, str]:
+    key = key.strip().lower()
+    if key not in CONFIG_DEFAULTS:
+        close = difflib.get_close_matches(key, CONFIG_DEFAULTS, n=1)
+        raise ValueError(f"unknown setting '{key}'" + (f" - did you mean {close[0]}?" if close else
+                                                         " (see the settings in " + path.name + ")"))
+    sync_config(path)
+    text = path.read_bytes().decode("utf-8")
+    raw = parse_config_text(text, path.name)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    old = raw.get(key, "")
+    old_text = ", ".join(old) if isinstance(old, list) else str(old)
+    if key in LIST_CONFIG_KEYS:
+        items = [part for v in values for part in split_list(v)]
+        block, new_text = render_list(key, items, newline), ", ".join(items)
+    else:
+        new_text = " ".join(values).strip()
+        block = f"{key}: {config_value_text(new_text)}".rstrip() + newline
+    lines, out, skipping = text.splitlines(keepends=True), [], False
+    for line in lines:
+        bare = line.lstrip("\ufeff")
+        match = None if bare.lstrip().startswith("#") else CONFIG_KEY_RE.match(bare)
+        if skipping and LIST_ITEM_RE.match(line):
+            continue
+        skipping = False
+        if match and match.group(1).lower() == key:
+            out.append(("\ufeff" if line.startswith("\ufeff") else "") + block)
+            skipping = key in LIST_CONFIG_KEYS
+            continue
+        out.append(line)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
+    try:
+        tmp.write_bytes("".join(out).encode("utf-8"))
+        try:
+            load_config(tmp)
+        except ValueError as e:
+            raise ValueError(f"{key}: {str(e).replace(tmp.name, path.name)} - nothing was changed")
+        st = path.stat()
+        os.chmod(tmp, st.st_mode)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except PermissionError:
+            pass
+        ensure_parent(LAYOUT.state / "config.bak").write_bytes(text.encode("utf-8"))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return old_text, new_text
+
+
+def run_set_config(values: list[str], dry_run: bool) -> int:
+    path = config_source()
+    if len(values) == 1:
+        key = values[0].strip().lower()
+        if key not in CONFIG_DEFAULTS:
+            say_error(f"unknown setting '{key}'")
+            return 2
+        raw = parse_config_text(path.read_text(encoding="utf-8"), path.name) if path.is_file() else {}
+        value = raw.get(key, config_default(key, raw))
+        say(f"{key}: {', '.join(value) if isinstance(value, list) else value}")
+        say(dim(f"  {CONFIG_HELP[key]}"))
+        return 0
+    if dry_run:
+        say(cyan(f"{SYM['dry']} Dry run - would set {values[0]} to {' '.join(values[1:])} in {path}"))
+        return 0
+    if not os.access(path if path.exists() else path.parent, os.W_OK):
+        ensure_root()
+    try:
+        old, new = set_config_value(path, values[0], values[1:])
+    except (OSError, ValueError) as e:
+        say_error(str(e))
+        return 2
+    key = values[0].strip().lower()
+    if old == new:
+        say(f"{green(SYM['ok'])} {key} is already {new or '(empty)'}")
+        return 0
+    say(f"{green(SYM['ok'])} {key}: {old or '(empty)'} {SYM['arrow']} {new or '(empty)'}  {dim(str(path))}")
+    if key in SCHEDULE_KEYS and os.geteuid() == 0:
+        for line in schedule_checks(load_config(path), False, quick=False)[0]:
+            say(line)
+    elif key.startswith("live_"):
+        say(dim(f"  The {LIVE_SERVICE} picks this up by itself"))
+    return 0
 
 
 def stack_dirs(base: Path, configured: list[Path]) -> list[Path]:
@@ -1037,6 +1289,7 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         health_wait=_parse_int(get("health_wait"), "health_wait"),
         image_check=_parse_bool(get("image_check"), "image_check"),
         image_check_interval=_parse_int(get("image_check_interval"), "image_check_interval"),
+        image_prune=parse_choice(get("image_prune"), "image_prune", IMAGE_PRUNE_MODES),
         command_timeout=_parse_int(get("command_timeout"), "command_timeout"),
         manage_cron=_parse_bool(get("manage_cron"), "manage_cron"),
         healthcheck_interval=_parse_int(get("healthcheck_interval"), "healthcheck_interval"),
@@ -1047,7 +1300,17 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         icon_index_days=max(1, _parse_int(get("icon_index_days"), "icon_index_days")),
         parallel_stacks=max(1, _parse_int(get("parallel_stacks"), "parallel_stacks")),
         error_actions=_parse_bool(get("error_actions"), "error_actions"),
+        healthcheck_mode=parse_choice(get("healthcheck_mode"), "healthcheck_mode", HEALTHCHECK_MODES),
+        live_mode=parse_choice(get("live_mode"), "live_mode", LIVE_MODES),
+        live_interval=max(2, _parse_int(get("live_interval"), "live_interval")),
     )
+
+
+def parse_choice(value: str, key: str, choices: tuple[str, ...]) -> str:
+    choice = value.strip().lower()
+    if choice not in choices:
+        raise ValueError(f"'{key}' must be {' or '.join(choices)}, got '{value}'")
+    return choice
 
 
 DOCKER_RUN_AS: dict = {}
@@ -1481,15 +1744,17 @@ def plan_cron(current: str, entry: list[str] | str | None) -> tuple[str, str]:
 CRON_CHECKED = LAYOUT.state / "cron.checked"
 
 
-def ensure_cron(cfg: Config, dry_run: bool, quick: bool = False) -> tuple[str, str]:
+def ensure_cron(cfg: Config, dry_run: bool, quick: bool = False, wanted_entry: bool = True) -> tuple[str, str]:
     try:
-        block = cron_block(cfg)
+        block = cron_block(cfg) if wanted_entry else None
     except ValueError as e:
         return "error", str(e)
-    wanted = "\n".join(block)
+    wanted = "\n".join(block) if block else "(none)"
     if quick and recently(CRON_CHECKED, QUIET_RECHECK_SECONDS, wanted):
         return "same", ""
     if shutil.which("crontab") is None:
+        if not block:
+            return "same", ""
         return "error", "crontab not found - install cron first (Debian/Ubuntu: apt install cron)"
     try:
         current = read_crontab()
@@ -1503,6 +1768,8 @@ def ensure_cron(cfg: Config, dry_run: bool, quick: bool = False) -> tuple[str, s
             mark(CRON_CHECKED, wanted)
     except RuntimeError as e:
         return "error", f"could not update the crontab: {e}"
+    if not block:
+        return "removed", old
     return ("updated" if old else "added"), old or ""
 
 
@@ -1510,6 +1777,9 @@ def describe_cron(cfg: Config, state: str, old: str, dry_run: bool = False) -> s
     every = fmt_interval(cfg.healthcheck_interval)
     if state == "error":
         return yellow(f"{SYM['warn']} Cron job not checked: {old} (manage_cron: false stops this check)")
+    if state == "removed":
+        return (cyan(f"{SYM['dry']} Dry run - would remove the cron job (the {LIVE_SERVICE} runs the health checks)")
+                if dry_run else f"{green(SYM['ok'])} Cron job removed: the {LIVE_SERVICE} runs the health checks now")
     if state == "same":
         return f"{green(SYM['ok'])} Health check already runs {every}"
     verb = {"added": "add", "updated": "update"}[state]
@@ -1531,17 +1801,24 @@ def run_install(cfg: Config, dry_run: bool) -> int:
         say_error(f"stacks_directory does not exist: {', '.join(map(str, missing))} - "
                   f"edit {CONFIG_FILE} and run --install again")
         return 2
-    state, old = ensure_cron(cfg, dry_run)
+    lines, ok = schedule_checks(cfg, dry_run, quick=False)
     say()
-    if state == "error":
-        say_error(f"Could not set up the cron job: {old}")
+    for line in lines:
+        say(line)
+    if not ok:
         return 2
-    say(describe_cron(cfg, state, old, dry_run))
-    say(dim(f"  Change healthcheck_interval in {CONFIG_FILE.name}; TugBoat keeps the cron job in line on every run"))
+    say(dim(f"  Change healthcheck_mode / healthcheck_interval in {CONFIG_FILE.name}; "
+            "TugBoat keeps the service and cron job in line on every run"))
     return 0
 
 
 def run_uninstall(cfg: Config, dry_run: bool) -> int:
+    if os.geteuid() == 0 and LIVE_UNIT.exists():
+        state, note = ensure_live_service(replace(cfg, healthcheck_mode="cron"), dry_run)
+        say(describe_live(cfg, state, note, dry_run))
+        if cfg.healthcheck_mode == "live" and state != "error":
+            say(yellow(f"{SYM['warn']} healthcheck_mode is live, so the next run adds it again - "
+                       f"set healthcheck_mode: cron in {CONFIG_FILE.name} to keep it off"))
     if shutil.which("crontab") is None:
         say_error("crontab not found")
         return 2
@@ -1564,6 +1841,342 @@ def run_uninstall(cfg: Config, dry_run: bool) -> int:
         say(yellow(f"{SYM['warn']} manage_cron is on, so the next run adds it again - "
                    f"set manage_cron: false in {CONFIG_FILE.name} to keep it off"))
     return 0
+
+
+LIVE_SERVICE = "tugboat-live.service"
+LIVE_UNIT = Path("/etc/systemd/system") / LIVE_SERVICE
+LIVE_CHECKED = LAYOUT.state / "live.checked"
+LIVE_UNIT_TEMPLATE = """# Written by TugBoat (healthcheck_mode in TugBoat.conf) - changes here are replaced
+[Unit]
+Description=TugBoat live container status
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart={python} {script} --watch
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=5
+# Error actions started by the watcher keep running when it restarts.
+KillMode=process
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def systemctl(*args: str) -> tuple[int, str]:
+    try:
+        p = subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return -1, str(e)
+    return p.returncode, _last_line(p.stderr or p.stdout, f"systemctl {' '.join(args)} exit code {p.returncode}")
+
+
+def systemd_present() -> bool:
+    return Path("/run/systemd/system").is_dir() and shutil.which("systemctl") is not None
+
+
+def unit_arg(value: object) -> str:
+    text = str(value)
+    return json.dumps(text) if any(c.isspace() or c in "\"'\\" for c in text) else text
+
+
+def live_unit() -> str:
+    return LIVE_UNIT_TEMPLATE.format(python=unit_arg(sys.executable), script=unit_arg(Path(__file__).resolve()))
+
+
+def ensure_live_service(cfg: Config, dry_run: bool, quick: bool = False) -> tuple[str, str]:
+    wanted = live_unit() if cfg.healthcheck_mode == "live" else ""
+    if not systemd_present():
+        return ("unsupported", "this system does not use systemd - the health checks run from cron "
+                "(or run 'tugboat --watch' with your own service manager)") if wanted else ("same", "")
+    if quick and recently(LIVE_CHECKED, QUIET_RECHECK_SECONDS, wanted):
+        return "same", ""
+    try:
+        current = LIVE_UNIT.read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+    if not wanted:
+        if current and not dry_run:
+            systemctl("disable", "--now", LIVE_SERVICE)
+            LIVE_UNIT.unlink(missing_ok=True)
+            systemctl("daemon-reload")
+        if not dry_run:
+            mark(LIVE_CHECKED, "")
+        return ("removed" if current else "same"), ""
+    running = systemctl("is-active", "--quiet", LIVE_SERVICE)[0] == 0
+    enabled = systemctl("is-enabled", "--quiet", LIVE_SERVICE)[0] == 0
+    if current == wanted and running and enabled:
+        mark(LIVE_CHECKED, wanted)
+        return "same", ""
+    if dry_run:
+        return ("updated" if current else "added"), ""
+    try:
+        LIVE_UNIT.write_text(wanted, encoding="utf-8")
+    except OSError as e:
+        return "error", f"could not write {LIVE_UNIT} ({e.strerror or e})"
+    for args in (("daemon-reload",), ("enable", LIVE_SERVICE),
+                 ("restart" if current != wanted and running else "start", LIVE_SERVICE)):
+        rc, err = systemctl(*args)
+        if rc != 0:
+            return "error", err
+    mark(LIVE_CHECKED, wanted)
+    return ("updated" if current else "added"), ""
+
+
+def describe_live(cfg: Config, state: str, note: str, dry_run: bool = False) -> str:
+    how = "on every Docker change" if cfg.live_mode == "events" else f"every {cfg.live_interval}s"
+    if state in ("error", "unsupported"):
+        return yellow(f"{SYM['warn']} Live status not set up: {note}")
+    if dry_run and state != "same":
+        verb = {"added": "add", "updated": "update", "removed": "remove"}[state]
+        return cyan(f"{SYM['dry']} Dry run - would {verb} the {LIVE_SERVICE}")
+    return {"same": f"{green(SYM['ok'])} Live status runs ({how})",
+            "added": f"{green(SYM['ok'])} Live status service started: {LIVE_SERVICE} ({how})",
+            "updated": f"{green(SYM['ok'])} Live status service updated ({how})",
+            "removed": f"{green(SYM['ok'])} Live status service removed (healthcheck_mode: cron)"}[state]
+
+
+LIVE_EVENTS = ("start", "restart", "die", "stop", "oom", "pause", "unpause", "destroy", "health_status")
+LIVE_DEBOUNCE = 1.5
+LIVE_FALLBACK_SECONDS = 60
+LIVE_RECONNECT_SECONDS = (5, 60)
+LIVE_RESTART_CODE = 3
+LIVE_FIRST_FULL_CHECK = 15
+
+
+def schedule_checks(cfg: Config, dry_run: bool, quick: bool) -> tuple[list[str], bool]:
+    lines: list[str] = []
+    live = False
+    if cfg.healthcheck_mode == "live":
+        if os.geteuid() == 0:
+            state, note = ensure_live_service(cfg, dry_run, quick)
+            live = state not in ("error", "unsupported")
+            if not quick or state not in ("same", "unsupported"):
+                lines.append(describe_live(cfg, state, note, dry_run))
+        else:
+            live = systemd_present() and LIVE_UNIT.exists()
+    elif os.geteuid() == 0:
+        state, note = ensure_live_service(cfg, dry_run, quick)
+        if state != "same":
+            lines.append(describe_live(cfg, state, note, dry_run))
+    ok = live
+    if cfg.manage_cron or not quick:
+        state, old = ensure_cron(cfg, dry_run, quick, wanted_entry=not live)
+        ok = ok or state != "error"
+        if state != "same" or (not quick and not live):
+            lines.append(describe_cron(cfg, state, old, dry_run))
+    return lines, ok
+
+
+def uses_cron(cfg: Config) -> bool:
+    return cfg.healthcheck_mode == "cron" or not systemd_present()
+
+
+def health_print(snap: dict) -> str:
+    return json.dumps([snap["health"], snap["summary"], snap["problems"],
+                       [[c.get(k) for k in ("name", "state", "health", "error")] for c in snap["containers"]]])
+
+
+def file_stamp(path: Path) -> object:
+    try:
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+class LiveWatch:
+
+    def __init__(self, cfg: Config, verbose: bool):
+        self.cfg, self.verbose = cfg, verbose
+        self.seen: dict[str, str] = {}
+        self.fixers: dict[str, subprocess.Popen] = {}
+        self.events: "queue.Queue[str | None]" = queue.Queue()
+        self.proc: subprocess.Popen | None = None
+        self.last_fallback = 0.0
+        self.backoff = LIVE_RECONNECT_SECONDS[0]
+        self.full: subprocess.Popen | None = None
+        self.full_at = time.monotonic() + LIVE_FIRST_FULL_CHECK
+        self.script, self.conf = Path(__file__).resolve(), config_source()
+        self.stamps = (file_stamp(self.script), file_stamp(self.conf))
+
+    def log(self, msg: str) -> None:
+        say(f"{datetime.now().strftime('%H:%M:%S')} {msg}")
+
+    def listen(self) -> None:
+        args = ["docker", "events", "--format", "{{json .}}", "--filter", "type=container",
+                "--filter", f"label={COMPOSE_PROJECT_LABEL}", *(x for e in LIVE_EVENTS for x in ("--filter", f"event={e}"))]
+        try:
+            self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                         errors="replace", stdin=subprocess.DEVNULL, **DOCKER_RUN_AS)
+        except OSError as e:
+            self.log(f"could not run docker events: {e}")
+            self.events.put(None)
+            return
+        stream = self.proc.stdout
+
+        def read() -> None:
+            for line in stream:
+                self.events.put(line)
+            self.events.put(None)
+        threading.Thread(target=read, daemon=True).start()
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+
+    def check(self) -> None:
+        now = time.monotonic()
+        fallback = self.cfg.live_mode == "events" or now - self.last_fallback >= LIVE_FALLBACK_SECONDS
+        if fallback:
+            self.last_fallback = now
+        stacks = [s for s in find_stacks(self.cfg.stacks_dirs, self.cfg.ignore_folders) if not stack_busy(s.name)]
+        snaps = check_all(stacks, fallback=fallback)
+        changed = [s for s in stacks if s.name in snaps and self.seen.get(s.name) != health_print(snaps[s.name])]
+        db = StatusDB(self.cfg.status_file)
+        if changed:
+            for stack in changed:
+                snap = snaps[stack.name]
+                old = db.stack(stack.name).get("health")
+                db.set_health(stack.name, snap, stack)
+                if old != snap["health"] or snap["problems"] or self.verbose:
+                    arrow = f"{old} {SYM['arrow']} " if old and old != snap["health"] else ""
+                    problems = f" - {'; '.join(snap['problems'])}" if snap["problems"] else ""
+                    self.log(f"{stack.name}: {arrow}{snap['health']} ({snap['summary']}){problems}")
+            try:
+                db.save()
+                if os.geteuid() == 0:
+                    os.chown(db.path, *self.cfg.file_owner)
+            except OSError as e:
+                self.log(f"could not write {db.path}: {e.strerror or e}")
+                return
+            self.seen.update((s.name, health_print(snaps[s.name])) for s in changed)
+        if self.cfg.error_actions and not (self.full and self.full.poll() is None):
+            self.fix([s for s in stacks if s.name in snaps], db)
+
+    def fix(self, stacks: list[Path], db: StatusDB) -> None:
+        for name in [n for n, p in self.fixers.items() if p.poll() is not None]:
+            del self.fixers[name]
+        due = [s.name for s, _ in due_error_actions([s for s in stacks if s.name not in self.fixers], db, quiet=True)]
+        for name in due:
+            self.log(f"{name}: running its error actions")
+            try:
+                self.fixers[name] = subprocess.Popen(
+                    [sys.executable, str(self.script), "--healthcheck", name, "--no-image-check"],
+                    stdin=subprocess.DEVNULL, start_new_session=True)
+            except OSError as e:
+                self.log(f"{name}: could not start the error actions: {e}")
+
+    def full_check(self) -> None:
+        if time.monotonic() < self.full_at or (self.full and self.full.poll() is None):
+            return
+        if any(p.poll() is None for p in self.fixers.values()):
+            return
+        self.full_at = time.monotonic() + self.cfg.healthcheck_interval * 60
+        try:
+            self.full = subprocess.Popen([sys.executable, str(self.script), "--healthcheck"], stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            self.log(f"could not start the health check: {e}")
+
+    def changed_files(self) -> int | None:
+        script, conf = file_stamp(self.script), file_stamp(self.conf)
+        if script != self.stamps[0]:
+            self.log(f"{self.script.name} changed - restarting")
+            return LIVE_RESTART_CODE
+        if conf != self.stamps[1]:
+            self.stamps = (script, conf)
+            try:
+                cfg = load_config(self.conf)
+            except (OSError, ValueError) as e:
+                self.log(f"config not reloaded: {e}")
+                return None
+            if cfg.healthcheck_mode != "live":
+                self.log("healthcheck_mode is not live - stopping")
+                return 0
+            if cfg.live_mode != self.cfg.live_mode:
+                self.stop()
+            self.cfg = cfg
+            self.log(f"config reloaded (live_mode: {cfg.live_mode})")
+        return None
+
+    def run(self) -> int:
+        how = "Docker events" if self.cfg.live_mode == "events" else f"a check every {self.cfg.live_interval}s"
+        self.log(f"{__title__} {__version__} live status: {how}, full health check every "
+                 f"{fmt_time(self.cfg.healthcheck_interval * 60)} -> {self.cfg.status_file}")
+        due_at, retry_at = time.monotonic(), 0.0
+        try:
+            while True:
+                now = time.monotonic()
+                if self.cfg.live_mode == "events" and self.proc is None and now >= retry_at:
+                    self.listen()
+                    due_at = min(due_at or now, now)
+                wait_for = min(5.0, max(0.0, due_at - now)) if due_at else 5.0
+                try:
+                    line = self.events.get(timeout=wait_for)
+                except queue.Empty:
+                    line = ""
+                if line is None:
+                    if self.cfg.live_mode == "events":
+                        self.log(f"docker events stopped - trying again in {self.backoff}s")
+                    self.stop()
+                    retry_at = time.monotonic() + self.backoff
+                    self.backoff = min(self.backoff * 2, LIVE_RECONNECT_SECONDS[1])
+                elif line:
+                    self.backoff = LIVE_RECONNECT_SECONDS[0]
+                    if self.verbose:
+                        try:
+                            event = json.loads(line)
+                            self.log(f"event: {event['Actor']['Attributes'].get('name', '?')} {event.get('Action', '')}")
+                        except (ValueError, KeyError, TypeError):
+                            pass
+                    due_at = min(due_at, time.monotonic() + LIVE_DEBOUNCE) if due_at else time.monotonic() + LIVE_DEBOUNCE
+                if due_at and time.monotonic() >= due_at:
+                    due_at = time.monotonic() + self.cfg.live_interval if self.cfg.live_mode == "interval" else 0.0
+                    try:
+                        self.check()
+                    except (OSError, ValueError) as e:
+                        self.log(f"check failed: {e}")
+                self.full_check()
+                code = self.changed_files()
+                if code is not None:
+                    return code
+                if self.cfg.live_mode == "interval" and not due_at:
+                    due_at = time.monotonic()
+        except KeyboardInterrupt:
+            self.log("stopped")
+            return 0
+        finally:
+            self.stop()
+
+
+def run_watch(cfg: Config, verbose: bool, dry_run: bool) -> int:
+    if cfg.healthcheck_mode != "live":
+        say(dim(f"healthcheck_mode is {cfg.healthcheck_mode} in {CONFIG_FILE.name} - nothing to do"))
+        return 0
+    if dry_run:
+        say(cyan(f"{SYM['dry']} Dry run - would keep {cfg.status_file} up to date (live_mode: {cfg.live_mode})"))
+        return 0
+    handle = open(ensure_parent(LAYOUT.state / "locks" / "live.lock"), "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say(yellow(f"{SYM['warn']} Live status already runs (see: systemctl status {LIVE_SERVICE})"))
+        return 0
+    os.environ.pop(UPDATED_ENV, None)
+    try:
+        return LiveWatch(cfg, verbose).run()
+    finally:
+        handle.close()
 
 
 def find_stacks(roots: list[Path], ignore: set[str] = frozenset()) -> list[Path]:
@@ -1836,6 +2449,44 @@ def prune_work(stack: Path, cfg: Config) -> StepWork:
         removed = f"removed {len(old)}, " if old else ""
         return True, f"{removed}keeping {kept}/{keep if keep > 0 else 'all'}{why}", []
     return work
+
+
+def stack_image_ids(stack: Path) -> set[str]:
+    rc, out, _ = docker(["compose", "ps", "--all", "-q"], cwd=stack, timeout=30)
+    ids = out.split() if rc == 0 else []
+    if not ids:
+        return set()
+    rc, out, _ = docker(["inspect", "--type", "container", "--format", "{{.Image}}", *ids], timeout=30)
+    return set(out.split()) if rc == 0 else set()
+
+
+def image_prune_work(old: set[str], stack: Path) -> StepWork:
+    def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        gone = sorted(old - stack_image_ids(stack))
+        removed = 0
+        for image_id in gone:
+            rc, _, err = docker(["image", "rm", image_id], timeout=120)
+            if rc == 0:
+                removed += 1
+                emit(f"removed {image_id[7:19] or image_id}")
+        kept = len(gone) - removed
+        return True, (f"removed {removed} old image(s)" if removed else "no old images") + (
+            f", {kept} still in use" if kept else ""), []
+    return work
+
+
+PRUNE_ALL_CMD = "docker image prune -a -f"
+RECLAIMED_RE = re.compile(r"Total reclaimed space:\s*(\S+)")
+
+
+def prune_all_images(ui: Runner) -> None:
+    def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        rc, out, err = docker(["image", "prune", "-a", "-f"], timeout=600)
+        if rc != 0:
+            return False, _last_line(err or out, f"exit code {rc}"), []
+        freed = RECLAIMED_RE.search(out)
+        return True, f"freed {freed.group(1)}" if freed else "done", []
+    ui.step("Prune images", work, warn_only=True)
 
 
 def now_iso() -> str:
@@ -3254,20 +3905,19 @@ def snapshot(containers: list[dict]) -> dict:
             "containers": containers, "checked_at": now_iso()}
 
 
-def check_all(stacks: list[Path]) -> dict[str, dict]:
+def check_all(stacks: list[Path], fallback: bool = True) -> dict[str, dict]:
     if IS_TTY:
         write(f"  {cyan(SPINNER[0])} {dim(f'Checking {len(stacks)} stack(s)...')}")
     containers = all_compose_containers()
     grouped = group_by_stack(stacks, containers) if containers is not None else {}
-    add_errors([c for found in grouped.values() for c in found])
     snaps = {name: snapshot(found) for name, found in grouped.items() if found}
-    rest = [s for s in stacks if s.name not in snaps]
+    rest = [s for s in stacks if s.name not in snaps] if fallback else []
     if rest:
         with ThreadPoolExecutor(max_workers=min(8, len(rest))) as pool:
             snaps.update(zip((s.name for s in rest), pool.map(check_health, rest)))
     if IS_TTY:
         write("\r\033[K")
-    return {s.name: snaps[s.name] for s in stacks}
+    return {s.name: snaps[s.name] for s in stacks if s.name in snaps}
 
 
 def fmt_age(seconds: float) -> str:
@@ -3775,9 +4425,12 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
         ui.dry("Pull & start", f"would run: {UPDATE_CMD}")
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
+        if cfg.image_prune == "old":
+            ui.dry("Prune images", "would delete the stack's previous images that nothing uses any more")
         res.status = "would update"
         return res
 
+    old_images = stack_image_ids(stack) if cfg.image_prune == "old" else set()
     out = stop_containers(stack, cfg, ui)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
@@ -3815,6 +4468,8 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
     elif not out.ok:
         return _fail(res, "Health check", out, "updated but unhealthy")
 
+    if old_images:
+        ui.step("Prune images", image_prune_work(old_images, stack), warn_only=True)
     res.status = "updated"
     return res
 
@@ -4254,14 +4909,15 @@ def error_chain(stack: Path, rule_: ErrorRule, snap: dict, cfg: Config, stacks: 
     return lines, record, run.snap
 
 
-def due_error_actions(selected: list[Path], db: StatusDB) -> list[tuple[Path, ErrorRule]]:
+def due_error_actions(selected: list[Path], db: StatusDB, quiet: bool = False) -> list[tuple[Path, ErrorRule]]:
     due = []
     for stack in selected:
         entry = db.stack(stack.name)
         try:
             rules = load_stack_file(stack)
         except (OSError, ValueError) as e:
-            say(yellow(f"{SYM['warn']} {stack.name}/{STACK_FILE} ignored: {e}"))
+            if not quiet:
+                say(yellow(f"{SYM['warn']} {stack.name}/{STACK_FILE} ignored: {e}"))
             continue
         rule_ = next((r for r in rules if entry.get("health") in r.triggers and r.steps), None)
         last_action = entry.get("last_action") or {}
@@ -4272,6 +4928,8 @@ def due_error_actions(selected: list[Path], db: StatusDB) -> list[tuple[Path, Er
         last = entry.get("error_action") or {}
         if last.get("finished_at") and not last.get("recovered") and not last.get("skipped") \
                 and is_fresh(last.get("started_at"), rule_.cooldown):
+            if quiet:
+                continue
             say(dim(f"  {stack.name}: error actions ran {fmt_ago(last.get('started_at'))} without fixing it - "
                     f"next try after {fmt_time(rule_.cooldown)}"))
             continue
@@ -4401,12 +5059,17 @@ def main() -> int:
     mode.add_argument("--install", action="store_true",
                       help="set up the cron job that runs --healthcheck every healthcheck_interval "
                            "minutes (TugBoat also keeps it in line on every run, see manage_cron)")
-    mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job")
+    mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job and live status service")
+    mode.add_argument("--watch", action="store_true",
+                      help=f"keep container health in the status file up to date (what {LIVE_SERVICE} runs)")
     mode.add_argument("--soft-reset", action="store_true",
                       help="forget what TugBoat found by itself (image checks, icons, error-action records); "
                            "settings, backups and history stay")
     mode.add_argument("--run-fixes", action="store_true",
                       help="run .TugBoat/bin/fixes.sh now (it also runs by itself whenever it changes)")
+    mode.add_argument("--set-config", nargs="+", metavar=("SETTING", "VALUE"),
+                      help="change one setting in TugBoat.conf, e.g. --set-config live_interval 5 "
+                           "(list settings take several values; only SETTING shows its value)")
     mode.add_argument("--check-update", action="store_true",
                       help="check GitHub for a newer TugBoat release")
     mode.add_argument("--self-update", action="store_true",
@@ -4448,6 +5111,8 @@ def main() -> int:
         if args.check_update:
             banner()
             return run_check_update()
+        if args.set_config:
+            return run_set_config(args.set_config, args.dry_run)
         if args.self_update:
             script = Path(__file__).resolve()
             if not args.dry_run and not (os.access(script, os.W_OK) and os.access(script.parent, os.W_OK)):
@@ -4459,7 +5124,7 @@ def main() -> int:
         if cfg.require_root and not args.dry_run:
             ensure_root(non_interactive=args.auto or not sys.stdin.isatty())
         banner()
-        needed = missing_dependencies(not args.uninstall, cfg.manage_cron or args.install or args.uninstall)
+        needed = missing_dependencies(not args.uninstall, (cfg.manage_cron or args.install) and uses_cron(cfg))
         if needed:
             needed = handle_dependencies(needed, cfg, args)
         if "docker" in needed or "compose" in needed:
@@ -4524,13 +5189,15 @@ def main() -> int:
         if not args.dry_run:
             for found_stack in stacks:
                 ensure_stack_file(found_stack)
-        if cfg.manage_cron and not args.dry_run:
-            state, old = ensure_cron(cfg, False, quick=args.healthcheck is not None)
-            if state != "same":
-                say(describe_cron(cfg, state, old))
+        if not args.dry_run and not args.watch and (cfg.manage_cron or os.geteuid() == 0):
+            for line in schedule_checks(cfg, False, quick=args.healthcheck is not None)[0]:
+                say(line)
     except (OSError, ValueError) as e:
         say_error(str(e))
         return 2
+
+    if args.watch:
+        return run_watch(cfg, args.verbose, args.dry_run)
 
     if args.soft_reset:
         return run_soft_reset(cfg, stacks, args.dry_run)
@@ -4845,6 +5512,12 @@ def main() -> int:
             break
 
     results = [finished[s.name] for s in selected if s.name in finished]
+    if action == "update" and cfg.image_prune == "all" and not interrupted and any(r.status in ("updated", "would update") for r in results):
+        rule("Images")
+        if args.dry_run:
+            ui.dry("Prune images", f"would run: {PRUNE_ALL_CMD}")
+        else:
+            prune_all_images(ui)
     pending = [s.name for s in selected if s.name not in finished]
     print_report(results, pending, action, time.monotonic() - run_start, interrupted)
     if db:

@@ -49,9 +49,11 @@ wget -qO- https://raw.githubusercontent.com/hen-io/TugBoat/main/install.sh | sud
 | `sudo tugboat --check-update` | Check for new TugBoat update |
 | `sudo tugboat --self-update` | Install new TugBoat update |
 | `sudo tugboat --remove web` | Remove a stack's containers and networks (`docker compose down --remove-orphans`); files and volumes stay |
-| `sudo tugboat --install` | Set up the health check cron job |
-| `sudo tugboat --uninstall` | Remove the health check cron job |
+| `sudo tugboat --install` | Set up the health checks: the `tugboat-live` service, or the cron job (`healthcheck_mode`) |
+| `sudo tugboat --uninstall` | Remove the `tugboat-live` service and the health check cron job |
+| `sudo tugboat --watch` | Keep the status file up to date live and run the health checks (what the `tugboat-live` service runs) |
 | `sudo tugboat --soft-reset` | Forget what TugBoat found by itself (image checks, icons, error-action records); settings, backups and history stay |
+| `sudo tugboat --set-config live_interval 5` | Change one setting in `TugBoat.conf` (checked before it is saved; only the name shows the current value) |
 | `sudo tugboat --run-fixes` | Run `.TugBoat/bin/fixes.sh` now |
 | `sudo tugboat --stop --stack web` | Name stacks with `--stack` instead of after the action |
 | `sudo tugboat --stop --all` | Run the action on all stacks (on its own: update all) |
@@ -79,11 +81,14 @@ Settings are in `TugBoat.conf` in the scripts root folder. Missing settings are 
 | `backup` / `backup_retention` | `true` / `15` | Back up a stack before updating, and how many backups to keep (`0` = keep all) |
 | `backup_large_mb` / `backup_large_retention` | `250` / `5` | If a stack's newest backup is bigger than this many MB, keep only this many backups instead of `backup_retention` (`0` = off) |
 | `ignore_folders` | (none) | Comma-separated stack folders to leave alone |
+| `image_prune` | `all` | After an update, delete: `all` = every unused image (`docker image prune -a -f`, once after all stacks), `old` = only the stack's previous images, `off` = nothing |
 | `image_check_interval` | `60` | Minutes between checks for new images |
 | `auto_update` | `true` | Install new TugBoat versions automatically |
-| `manage_cron` | `true` | Let TugBoat keep its cron job in order |
+| `healthcheck_mode` | `live` | `live`: the `tugboat-live` systemd service (starts at boot) updates the status file as soon as a container changes and runs the health checks, no cron job; `cron`: a cron job runs the health checks (also used when there is no systemd) |
+| `live_mode` / `live_interval` | `events` / `10` | Live mode: react to Docker events, or `interval`: check every `live_interval` seconds |
+| `manage_cron` | `true` | Let TugBoat add, update and remove its cron job to match `healthcheck_mode` |
 | `install_dependencies` | `true` | Install missing Docker, Compose plugin and cron (apt, dnf, pacman) |
-| `healthcheck_interval` | `1` | Minutes between runs of the health check cron job (1-59, or whole hours: 60, 120 ...) |
+| `healthcheck_interval` | `1` | Minutes between full health checks: image versions, icons, error actions (cron: 1-59, or whole hours: 60, 120 ...) |
 | `update_check_seconds` | `1800` | Seconds between checks for a new TugBoat release (checked when TugBoat starts) |
 | `registry_timeout` | `10` | Seconds to wait for an image registry when checking for new images |
 

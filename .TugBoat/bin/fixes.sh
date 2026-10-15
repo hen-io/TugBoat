@@ -166,6 +166,13 @@ if grep -q '^update_check_interval[ \t]*:' "$WORK"; then
     fi
 fi
 
+if grep -q '^live_status[ \t]*:' "$WORK"; then
+    if [ "$(conf_get live_status)" = "false" ] && ! grep -q '^healthcheck_mode[ \t]*:' "$WORK"; then
+        sed -i 's/^live_status[ \t]*:.*/healthcheck_mode: cron/' "$WORK"
+    fi
+    sed -i -e '/^live_status[ \t]*:/d' -e '/^# Keep container health in the status file up to date between health checks/d' "$WORK"
+fi
+
 if cmp -s "$WORK" "$CONF"; then
     rm -f "$WORK"
 else
