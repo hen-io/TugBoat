@@ -48,6 +48,22 @@ wget -qO- https://raw.githubusercontent.com/hen-io/TugBoat/main/install.sh | sud
 | `sudo tugboat --help` | All options |
 | `sudo tugboat --check-update` | Check for new TugBoat update |
 | `sudo tugboat --self-update` | Install new TugBoat update |
+| `sudo tugboat --remove web` | Remove a stack's containers and networks (`docker compose down --remove-orphans`); files and volumes stay |
+| `sudo tugboat --install` | Set up the health check cron job |
+| `sudo tugboat --uninstall` | Remove the health check cron job |
+| `sudo tugboat --soft-reset` | Forget what TugBoat found by itself (image checks, icons, error-action records); settings, backups and history stay |
+| `sudo tugboat --run-fixes` | Run `.TugBoat/bin/fixes.sh` now |
+| `sudo tugboat --stop --stack web` | Name stacks with `--stack` instead of after the action |
+| `sudo tugboat --stop --all` | Run the action on all stacks (on its own: update all) |
+| `sudo tugboat --auto` | No questions: update all stacks unless named |
+| `sudo tugboat --update --all -j 2` | Handle this many stacks at the same time (`--parallel N`) |
+| `sudo tugboat --update web --skip-backup` | Update without backing up the stack first |
+| `sudo tugboat --healthcheck --no-error-actions` | Do not run the error actions from the stacks' `TugBoat.stack` files |
+| `sudo tugboat --healthcheck --no-image-check` | Do not check the registries for new image versions |
+| `sudo tugboat --healthcheck --check-images` | Check the registries now, even if `image_check_interval` has not passed |
+| `sudo tugboat --update web -v` | Show the full command output live (`--verbose`) |
+| `sudo tugboat --update web --dry-run` | Show what would happen without doing anything |
+| `tugboat --version` | Show the TugBoat version |
 ## Status file
 
 Every health check and action writes `tugboat.json` (by default in your container folder) with the health of every stack, its containers, whether newer images are available and the result of the last action.
@@ -70,3 +86,25 @@ Settings are in `TugBoat.conf` in the scripts root folder. Missing settings are 
 | `healthcheck_interval` | `1` | Minutes between runs of the health check cron job (1-59, or whole hours: 60, 120 ...) |
 | `update_check_seconds` | `1800` | Seconds between checks for a new TugBoat release (checked when TugBoat starts) |
 | `registry_timeout` | `10` | Seconds to wait for an image registry when checking for new images |
+
+## TugBoat.stack
+
+Every stack folder gets a `TugBoat.stack` file. TugBoat adds any setting that is missing (and converts the old layout); values you set are kept. A file that cannot be read is left as it is and reported.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `stack.enabled` | `true` | `false` = TugBoat ignores this stack and drops it from the status file |
+| `stack.priority` | `1` | Lower numbers start first and stop last; stacks with the same number run side by side |
+| `stack.icons.stack` | (found) | Icon of the stack: an http(s) address, a file in the stack folder or an icon name |
+| `stack.icons.containers.<name>` | (found) | Icon of one container, same values as above |
+| `stack.on_error` | (none) | List of rules that run when the stack is not running or unhealthy |
+| `on_error[].name` | (none) | Name of the rule, shown in the status file and webhooks |
+| `on_error[].trigger_on` | `not_running, unhealthy` | When the rule runs |
+| `on_error[].cooldown` | `1h` | Time before the rule may run again (`30s`, `10m`, `1h`) |
+| `on_error[].actions` | (none) | Steps, run one at a time; stops as soon as the stack is healthy |
+| `- restart:` | | Restart the stack; options `retries` (default `1`) and `retry_delay` |
+| `- webhook: URL` | | POST the stack's state as JSON; the URL can use `{stack}` `{host}` `{health}` `{trigger}` `{rule}` `{summary}` `{error}` |
+| `- delay: 5s` | | Wait |
+| `- stack: restart other` | | `start`, `stop`, `restart`, `update` or `remove` another stack (or `all`) |
+| `- script: ./fix.sh` | | Run a script in the stack folder (gets `TUGBOAT_STACK`, `TUGBOAT_HEALTH`, `TUGBOAT_PROBLEMS` ...) |
+| `- reboot-host: true` | | Stop all stacks and reboot the host |

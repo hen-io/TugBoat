@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import fcntl
 import functools
@@ -32,7 +33,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.7.11"
+__version__ = "0.9.0"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -47,6 +48,7 @@ CONFIG_DEFAULTS = {
     "backup_large_mb": "250",
     "backup_large_retention": "5",
     "docker_user": "",
+    "file_owner": "1000:1000",
     "health_wait": "60",
     "image_check": "true",
     "image_check_interval": "60",
@@ -75,6 +77,7 @@ CONFIG_HELP = {
     "backup_large_mb": "A backup bigger than this many MB counts as large (0 = off)",
     "backup_large_retention": "Backups to keep for a stack whose newest backup is large",
     "docker_user": "Run docker commands as this user (empty = the user running TugBoat)",
+    "file_owner": "Owner of the files TugBoat writes (.TugBoat, TugBoat.stack), user:group as names or numbers",
     "health_wait": "Seconds to wait for containers to become healthy after a start",
     "image_check": "Check the registries for new image versions during the health check",
     "image_check_interval": "Minutes between registry checks per stack",
@@ -94,7 +97,7 @@ CONFIG_HELP = {
 CONFIG_GROUPS = (
     ("stacks_directory", "require_root", "status_file", "ignore_folders"),
     ("backup", "backup_path", "backup_retention", "backup_large_mb", "backup_large_retention"),
-    ("docker_user", "health_wait", "command_timeout", "parallel_stacks", "error_actions"),
+    ("docker_user", "file_owner", "health_wait", "command_timeout", "parallel_stacks", "error_actions"),
     ("image_check", "image_check_interval", "registry_timeout"),
     ("icons", "icon_index_days"),
     ("manage_cron", "healthcheck_interval", "install_dependencies"),
@@ -129,6 +132,38 @@ class Layout:
 
 LAYOUT = Layout(SCRIPT_DIR)
 CONFIG_FILE = LAYOUT.config
+
+
+def owned_paths(stacks: list[Path], backup_roots: list[Path]) -> list[Path]:
+    paths = [Path(__file__).resolve(), *(s / STACK_FILE for s in stacks)]
+    skip = {os.path.realpath(r) for r in backup_roots}
+    for root, dirs, files in os.walk(LAYOUT.data):
+        rel = Path(root).relative_to(LAYOUT.data).parts
+        paths.append(Path(root))
+        if (rel[:1] == ("backups",) and len(rel) == 2) or os.path.realpath(root) in skip:
+            dirs[:] = []
+            continue
+        paths += [Path(root) / f for f in files]
+    return paths
+
+
+def fix_ownership(owner: tuple[int, int], stacks: list[Path], backup_roots: list[Path]) -> int:
+    if os.geteuid() != 0:
+        return 0
+    failed = changed = 0
+    for path in owned_paths(stacks, backup_roots):
+        try:
+            st = os.lstat(path)
+            if (st.st_uid, st.st_gid) != owner:
+                os.lchown(path, *owner)
+                changed += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failed += 1
+    if failed:
+        say(yellow(f"{SYM['warn']} {failed} TugBoat file(s) could not be given to {owner[0]}:{owner[1]}"))
+    return changed
 
 
 def config_source() -> Path:
@@ -721,6 +756,7 @@ class Config:
     status_file: Path
     health_wait: int
     docker_user: str
+    file_owner: tuple[int, int]
     update_check: bool
     auto_update: bool
     image_check: bool
@@ -738,6 +774,21 @@ class Config:
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
+
+
+def parse_owner(value: str) -> tuple[int, int]:
+    user, _, group = value.strip().partition(":")
+    try:
+        if user.isdigit():
+            uid = int(user)
+            default_gid = uid
+        else:
+            entry = pwd.getpwnam(user)
+            uid, default_gid = entry.pw_uid, entry.pw_gid
+        gid = default_gid if not group else int(group) if group.isdigit() else grp.getgrnam(group).gr_gid
+    except (KeyError, ValueError):
+        raise ValueError(f"'file_owner' must be user:group (names or numbers), got '{value}'")
+    return uid, gid
 
 
 def _parse_bool(value: str, key: str) -> bool:
@@ -776,7 +827,12 @@ LIST_ITEM_RE = re.compile(r"^\s*-(?:\s+(.*))?$")
 
 def unquote(value: str) -> str:
     value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            return str(json.loads(value))
+        except ValueError:
+            return value[1:-1]
+    if len(value) >= 2 and value[0] == value[-1] == "'":
         return value[1:-1]
     return value
 
@@ -974,6 +1030,7 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
                         if n.strip().rstrip("/")},
         require_root=_parse_bool(get("require_root"), "require_root"),
         docker_user=get("docker_user").strip(),
+        file_owner=parse_owner(get("file_owner")),
         update_check=_parse_bool(get("update_check"), "update_check"),
         auto_update=_parse_bool(get("auto_update"), "auto_update"),
         status_file=resolve(get("status_file") or config_default("status_file", raw)),
@@ -1521,7 +1578,7 @@ def find_stacks(roots: list[Path], ignore: set[str] = frozenset()) -> list[Path]
         for d in sorted(root.iterdir()):
             if not (d.is_dir() and not d.name.startswith(".") and d.name.lower() not in ignore
                     and d.resolve() != LAYOUT.data.resolve()
-                    and any((d / f).is_file() for f in COMPOSE_FILES)):
+                    and any((d / f).is_file() for f in COMPOSE_FILES)) or not stack_settings(d).enabled:
                 continue
             if d.name in found:
                 say(yellow(f"{SYM['warn']} Stack '{d.name}' in {root} skipped: "
@@ -1560,6 +1617,8 @@ def pick_stacks_by_name(names: list[str], stacks: list[Path], cfg: Config) -> li
         if stack is None:
             if name.lower() in cfg.ignore_folders:
                 raise ValueError(f"Stack '{name}' is in ignore_folders in TugBoat.conf")
+            if any((root / name).is_dir() and not stack_settings(root / name).enabled for root in cfg.stacks_dirs):
+                raise ValueError(f"Stack '{name}' is disabled (enabled: false in its {STACK_FILE})")
             if any((root / name).is_dir() for root in cfg.stacks_dirs):
                 raise ValueError(f"'{name}' has no compose file ({', '.join(COMPOSE_FILES)})")
             raise ValueError(f"No stack named '{name}'. Available: {', '.join(by_name)}")
@@ -1836,7 +1895,65 @@ def compose_ps(stack: Path) -> tuple[list[dict] | None, str]:
         "exit_code": c.get("ExitCode"),
         "image": c.get("Image", ""),
         "status": c.get("Status", ""),
+        "error": "",
     } for c in raw], ""
+
+
+def container_problem(c: dict) -> str:
+    state, health = c["state"], c["health"]
+    if state in ("restarting", "dead", "paused"):
+        return state
+    if health == "unhealthy":
+        return "unhealthy"
+    if state == "exited" and c["exit_code"] not in (0, None):
+        return f"exited with code {c['exit_code']}"
+    if state == "created":
+        return "created but not started"
+    return ""
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+ERROR_WORD_RE = re.compile(r"error|fatal|panic|exception|fail|denied|refused|not found|cannot|can't", re.I)
+ERROR_MAX = 300
+
+
+def clean_error(text: str) -> str:
+    text = " ".join(ANSI_RE.sub("", str(text or "")).split())
+    return text if len(text) <= ERROR_MAX else text[:ERROR_MAX - 3].rstrip() + "..."
+
+
+def log_error(name: str) -> str:
+    rc, out, err = docker(["logs", "--tail", "20", name], timeout=15)
+    if rc != 0:
+        return ""
+    lines = [l for l in (err.splitlines() or out.splitlines()) if l.strip()] or [l for l in out.splitlines() if l.strip()]
+    hits = [l for l in lines if ERROR_WORD_RE.search(l)]
+    return clean_error((hits or lines or [""])[-1])
+
+
+def add_errors(containers: list[dict]) -> None:
+    for c in containers:
+        c.setdefault("error", "")
+    bad = [c for c in containers if container_problem(c) and not c["error"] and c["name"]]
+    if not bad:
+        return
+    rc, out, _ = docker(["inspect", "--type", "container", *(c["name"] for c in bad)], timeout=20)
+    try:
+        info = {str(i.get("Name", "")).lstrip("/"): i for i in json.loads(out)} if rc == 0 else {}
+    except ValueError:
+        info = {}
+    for c in bad:
+        st = (info.get(c["name"]) or {}).get("State") or {}
+        logs = (st.get("Health") or {}).get("Log") or []
+        if st.get("OOMKilled"):
+            c["error"] = "out of memory (killed by the kernel)"
+        elif st.get("Error"):
+            c["error"] = clean_error(st["Error"])
+        elif c["health"] == "unhealthy" and logs:
+            last = logs[-1]
+            c["error"] = clean_error(last.get("Output") or f"health check exit code {last.get('ExitCode')}")
+        if not c["error"] and c["state"] != "created":
+            c["error"] = log_error(c["name"])
 
 
 def summarize_health(containers: list[dict]) -> tuple[str, str, list[str]]:
@@ -1844,15 +1961,10 @@ def summarize_health(containers: list[dict]) -> tuple[str, str, list[str]]:
         return "stopped", "no containers", []
     problems: list[str] = []
     for c in containers:
-        name, state, health = c["name"] or c["service"], c["state"], c["health"]
-        if state in ("restarting", "dead", "paused"):
-            problems.append(f"{name}: {state}")
-        elif health == "unhealthy":
-            problems.append(f"{name}: unhealthy")
-        elif state == "exited" and c["exit_code"] not in (0, None):
-            problems.append(f"{name}: exited with code {c['exit_code']}")
-        elif state == "created":
-            problems.append(f"{name}: created but not started")
+        problem = container_problem(c)
+        if problem:
+            error = c.get("error")
+            problems.append(f"{c['name'] or c['service']}: {problem}" + (f" - {error}" if error else ""))
     running = [c for c in containers if c["state"] == "running"]
     healthy = [c for c in containers if c["health"] == "healthy"]
     starting = [c for c in containers if c["health"] == "starting"]
@@ -2581,16 +2693,8 @@ def stack_logo(stack: Path, base: Path) -> dict | None:
 
 
 def stack_file_icons(stack: Path) -> dict:
-    try:
-        data = parse_yaml((stack / STACK_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    icons = data.get("icons") if isinstance(data, dict) else None
-    if not isinstance(icons, dict):
-        return {}
-    containers = icons.get("containers") if isinstance(icons.get("containers"), dict) else {}
-    return {"stack": str(icons.get("stack") or ""),
-            "containers": {str(k): str(v or "") for k, v in containers.items()}}
+    settings = stack_settings(stack)
+    return settings.icons if settings.readable else {}
 
 
 def configured_icon(stack: Path, value: str, base: Path) -> dict | None:
@@ -2617,47 +2721,92 @@ def icon_setting(found: dict) -> str:
     return str(found.get("icon_url") or "")
 
 
+AUTO_ICONS = "auto-icons.json"
+
+
+def auto_icons() -> dict:
+    try:
+        data = json.loads((LAYOUT.state / AUTO_ICONS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def remember_auto_icons(stack: Path, stack_value: str, containers: dict[str, str]) -> None:
+    data = auto_icons()
+    entry = data.setdefault(str(stack), {"stack": "", "containers": {}})
+    entry["stack"] = stack_value or entry.get("stack", "")
+    entry.setdefault("containers", {}).update(containers)
+    try:
+        ensure_parent(LAYOUT.state / AUTO_ICONS).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def save_stack_icons(stack: Path, stack_value: str, containers: dict[str, str]) -> bool:
-    path = stack / STACK_FILE
-    try:
-        text = path.read_text(encoding="utf-8") if path.exists() else ""
-    except OSError:
-        return False
     current = stack_file_icons(stack)
+    if not current:
+        return False
     known = current.get("containers", {})
-    wanted_stack = current.get("stack") or stack_value
-    wanted = dict(known)
-    for name, value in containers.items():
-        if value and not wanted.get(name):
-            wanted[name] = value
-    if wanted_stack == current.get("stack", "") and wanted == known:
+    new_stack = "" if current.get("stack") else stack_value
+    new = {name: value for name, value in containers.items() if value and not known.get(name)}
+    if not new_stack and not new:
         return False
-    newline = "\r\n" if "\r\n" in text else "\n"
-    block = ["icons:", f'  stack: {json.dumps(wanted_stack)}' if wanted_stack else '  stack: ""', "  containers:"]
-    block += [f"    {name}: {json.dumps(value)}" for name, value in sorted(wanted.items())]
-    lines = text.splitlines()
-    start = next((i for i, line in enumerate(lines) if re.match(r"^icons\s*:", line)), None)
-    if start is None:
-        lines = lines + ([""] if lines and lines[-1].strip() else []) + block
-    else:
-        end = next((i for i in range(start + 1, len(lines))
-                    if lines[i].strip() and not lines[i][0].isspace() and not lines[i].startswith("#")), len(lines))
-        lines[start:end] = block
-    out = newline.join(lines) + newline
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
-    try:
-        tmp.write_text(out, encoding="utf-8")
-        owner = (path if path.exists() else stack).stat()
-        os.chmod(tmp, path.stat().st_mode if path.exists() else 0o644)
-        try:
-            os.chown(tmp, owner.st_uid, owner.st_gid)
-        except PermissionError:
-            pass
-        os.replace(tmp, path)
-    except OSError:
-        tmp.unlink(missing_ok=True)
+    if not update_stack_file(stack, {"stack": current.get("stack") or new_stack, "containers": {**known, **new}}):
         return False
+    remember_auto_icons(stack, new_stack, new)
     return True
+
+
+def forget_auto_icons(stack: Path) -> int:
+    written = auto_icons().get(str(stack)) or {}
+    current = stack_file_icons(stack)
+    if not current:
+        return 0
+    keep_stack = current.get("stack", "")
+    if keep_stack and keep_stack == written.get("stack"):
+        keep_stack = ""
+    ours = written.get("containers") or {}
+    keep = {n: v for n, v in current.get("containers", {}).items() if ours.get(n) != v}
+    removed = (current.get("stack", "") != keep_stack) + len(current.get("containers", {})) - len(keep)
+    if removed:
+        update_stack_file(stack, {"stack": keep_stack, "containers": keep}, replace_icons=True)
+    return removed
+
+
+FETCHED_KEYS = ("images", "updates_available", "images_checked_at", "icon", "icon_url", "icon_source", "error_action")
+
+
+def run_soft_reset(cfg: Config, stacks: list[Path], dry_run: bool) -> int:
+    say("\n" + bold("SOFT RESET"))
+    if dry_run:
+        say(cyan(f"  {SYM['dry']} Dry run - would clear image checks, icons and error-action records "
+                 f"of {len(stacks)} stack(s), the icon cache and the icons TugBoat wrote into TugBoat.stack"))
+        return 0
+    with file_lock(cfg.status_file.with_name(f".{cfg.status_file.name}.lock")):
+        db = StatusDB(cfg.status_file)
+        for entry in db.data["stacks"].values():
+            if isinstance(entry, dict):
+                for key in FETCHED_KEYS:
+                    entry.pop(key, None)
+                for c in entry.get("containers") or []:
+                    for key in ("icon", "icon_url", "icon_source"):
+                        c.pop(key, None) if isinstance(c, dict) else None
+        db.data.pop("release_check", None)
+        try:
+            ensure_parent(cfg.status_file).write_text(json.dumps(db.data, indent=2) + "\n", encoding="utf-8")
+        except OSError as e:
+            say_error(f"Could not write {cfg.status_file}: {e.strerror or e}")
+            return 2
+    removed = sum(forget_auto_icons(stack) for stack in stacks)
+    shutil.rmtree(LAYOUT.cache / "icons", ignore_errors=True)
+    (LAYOUT.state / AUTO_ICONS).unlink(missing_ok=True)
+    (LAYOUT.state / "cron.checked").unlink(missing_ok=True)
+    say(f"  {green(SYM['ok'])} Cleared image checks, icons and error-action records of {len(stacks)} stack(s)")
+    say(f"  {green(SYM['ok'])} Emptied the icon cache; removed {removed} icon setting(s) TugBoat had written "
+        f"into TugBoat.stack (ones you changed are kept)")
+    say(dim("  The next health check finds everything again.") + "\n")
+    return 0
 
 
 def container_icons(stack: Path, containers: list[dict], images: list[dict], base: Path) -> list[dict]:
@@ -3077,7 +3226,7 @@ def all_compose_containers() -> list[dict] | None:
         found.append({"name": name.split(",")[0], "service": service, "state": state.lower(),
                       "health": (health.group(1).replace("health: ", "") if health else ""),
                       "exit_code": int(exit_code.group(1)) if exit_code else (0 if state != "exited" else None),
-                      "image": image, "status": status, "_project": project, "_workdir": workdir})
+                      "image": image, "status": status, "error": "", "_project": project, "_workdir": workdir})
     return found
 
 
@@ -3099,6 +3248,7 @@ def group_by_stack(stacks: list[Path], containers: list[dict]) -> dict[str, list
 
 
 def snapshot(containers: list[dict]) -> dict:
+    add_errors(containers)
     health, summary, problems = summarize_health(containers)
     return {"health": health, "summary": summary, "problems": problems,
             "containers": containers, "checked_at": now_iso()}
@@ -3109,6 +3259,7 @@ def check_all(stacks: list[Path]) -> dict[str, dict]:
         write(f"  {cyan(SPINNER[0])} {dim(f'Checking {len(stacks)} stack(s)...')}")
     containers = all_compose_containers()
     grouped = group_by_stack(stacks, containers) if containers is not None else {}
+    add_errors([c for found in grouped.values() for c in found])
     snaps = {name: snapshot(found) for name, found in grouped.items() if found}
     rest = [s for s in stacks if s.name not in snaps]
     if rest:
@@ -3156,7 +3307,8 @@ def print_health_table(stacks: list[Path], snaps: dict[str, dict], db: StatusDB 
             extra.append(yellow(f"{SYM['up']} {fmt_updates(known['updates_available'])}"))
         if snap["problems"]:
             more = f" (+{len(snap['problems']) - 1} more)" if len(snap["problems"]) > 1 else ""
-            extra.append(style(snap["problems"][0] + more))
+            first = snap["problems"][0]
+            extra.append(style((first if len(first) <= 70 else first[:67] + "...") + more))
         tail = dim("  ·  ").join(extra)
         say(f"  {style(SYM[sym])} {stack.name:<{width}}  {style(health)} {dim(summary)}  {tail}".rstrip())
 
@@ -3668,24 +3820,24 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
 
 
 STACK_FILE = "TugBoat.stack"
-STACK_FILE_TEMPLATE = """# TugBoat.stack - what TugBoat does for this stack. Remove the "#" in front of the lines you want.
-# The steps run one at a time, top to bottom, and stop as soon as the stack is healthy again.
-#
-# actions:
-#   - error_action:
-#       trigger_on: not_running, unhealthy
-#       cooldown: 1h
-#       actions:
-#         - restart:
-#           retries: 3
-#           retry_delay: 30s
-#         - webhook: http://example.lan/api/tugboat/errors
-#         - delay: 5s
-#         - stack: restart other-stack
-#         - script: ./fix.sh
-#         - delay: 120s
-#         - reboot-host: true
-"""
+STACK_FILE_HEADER = "# TugBoat.stack - this stack's settings. TugBoat adds what is missing; the rest is yours to edit."
+STACK_FILE_EXAMPLE = """  # Example - remove the "#" in front of these lines to use it:
+  #  - name: restart, then tell me
+  #    trigger_on: not_running, unhealthy
+  #    cooldown: 1h
+  #    actions:
+  #      - restart:
+  #        retries: 3
+  #        retry_delay: 30s
+  #      - webhook: "https://example.lan/api/tugboat/errors?stack={stack}&error={error}"
+  #      - delay: 5s
+  #      - stack: restart other-stack
+  #      - script: ./fix.sh
+  #      - delay: 120s
+  #      - reboot-host: true
+  # Steps: restart, webhook, delay, stack (start|stop|restart|update|remove <stack|all>), script, reboot-host
+  # A webhook address can use {stack} {host} {health} {trigger} {rule} {summary} {error}"""
+STACK_PRIORITY = 1
 YAML_KEY_RE = re.compile(r"^([\w.-]+):(?:\s+(.*))?$")
 DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$")
 TRIGGERS = {"not_running": "stopped", "stopped": "stopped", "unhealthy": "unhealthy", "unknown": "unknown",
@@ -3764,6 +3916,20 @@ class ErrorRule:
     triggers: set[str]
     steps: list[tuple[str, str, dict]]
     cooldown: float
+    name: str = ""
+    trigger_text: str = "not_running, unhealthy"
+    cooldown_text: str = ""
+
+
+@dataclass
+class StackSettings:
+    enabled: bool = True
+    priority: int = STACK_PRIORITY
+    icons: dict = field(default_factory=lambda: {"stack": "", "containers": {}})
+    rules: list = field(default_factory=list)
+    error: str = ""
+    readable: bool = True
+    complete: bool = False
 
 
 @dataclass
@@ -3775,6 +3941,7 @@ class ErrorRun:
     snap: dict
     trigger: str
     done: list[dict] = field(default_factory=list)
+    rule: str = ""
 
 
 def step_spec(item: object) -> tuple[str, str, dict]:
@@ -3796,39 +3963,160 @@ def step_spec(item: object) -> tuple[str, str, dict]:
     return name, str(value or "").strip(), options
 
 
-def load_stack_file(stack: Path) -> list[ErrorRule]:
+def parse_rule(entry: object) -> ErrorRule:
+    if not isinstance(entry, dict):
+        raise ValueError("an on_error entry must be 'name/trigger_on/cooldown/actions' lines")
+    if "error_action" in entry:
+        body = entry["error_action"] if isinstance(entry["error_action"], dict) else {
+            k: v for k, v in entry.items() if k != "error_action"}
+    else:
+        body = entry
+    trigger_text = str(body.get("trigger_on") or "not_running, unhealthy")
+    names = [n.strip().lower() for n in trigger_text.split(",")]
+    unknown = [n for n in names if n and n not in TRIGGERS]
+    if unknown:
+        raise ValueError(f"unknown trigger_on '{unknown[0]}' (known: {', '.join(TRIGGERS)})")
+    steps = body.get("actions")
+    cooldown_text = str(body.get("cooldown") or "")
+    return ErrorRule({TRIGGERS[n] for n in names if n},
+                     [step_spec(item) for item in (steps if isinstance(steps, list) else [])],
+                     parse_duration(cooldown_text, ERROR_COOLDOWN), str(body.get("name") or ""),
+                     trigger_text, cooldown_text)
+
+
+def _read_settings(path: Path) -> StackSettings:
     try:
-        text = (stack / STACK_FILE).read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return []
-    data = parse_yaml(text)
-    entries = data.get("actions") if isinstance(data, dict) else None
-    rules: list[ErrorRule] = []
-    for entry in entries if isinstance(entries, list) else []:
-        if not isinstance(entry, dict) or "error_action" not in entry:
-            continue
-        body = entry["error_action"] if isinstance(entry["error_action"], dict) else entry
-        names = [n.strip().lower() for n in str(body.get("trigger_on") or "not_running, unhealthy").split(",")]
-        unknown = [n for n in names if n and n not in TRIGGERS]
-        if unknown:
-            raise ValueError(f"unknown trigger_on '{unknown[0]}' (known: {', '.join(TRIGGERS)})")
-        steps = body.get("actions")
-        rules.append(ErrorRule({TRIGGERS[n] for n in names if n},
-                               [step_spec(item) for item in (steps if isinstance(steps, list) else [])],
-                               parse_duration(body.get("cooldown"), ERROR_COOLDOWN)))
-    return rules
+        return StackSettings()
+    except OSError as e:
+        return StackSettings(error=e.strerror or str(e), readable=False)
+    try:
+        data = parse_yaml(text)
+    except ValueError as e:
+        return StackSettings(error=str(e), readable=False)
+    data = data if isinstance(data, dict) else {}
+    block = data.get("stack") if isinstance(data.get("stack"), dict) else {
+        "icons": data.get("icons"), "on_error": data.get("actions")}
+    settings = StackSettings(complete=isinstance(data.get("stack"), dict)
+                             and all(k in block for k in ("enabled", "priority", "icons", "on_error")))
+    try:
+        settings.enabled = _parse_bool(str(block.get("enabled", "true")), "enabled")
+        settings.priority = int(str(block.get("priority", STACK_PRIORITY)).strip() or STACK_PRIORITY)
+        icons = block.get("icons") if isinstance(block.get("icons"), dict) else {}
+        containers = icons.get("containers") if isinstance(icons.get("containers"), dict) else {}
+        settings.icons = {"stack": str(icons.get("stack") or ""),
+                          "containers": {str(k): str(v or "") for k, v in containers.items()}}
+        entries = block.get("on_error")
+        settings.rules = [parse_rule(e) for e in (entries if isinstance(entries, list) else [])]
+    except ValueError as e:
+        settings.error, settings.readable = str(e), False
+    return settings
+
+
+_STACK_SETTINGS: dict[str, tuple[object, StackSettings]] = {}
+
+
+def stack_settings(stack: Path) -> StackSettings:
+    path = stack / STACK_FILE
+    try:
+        st = path.stat()
+        key: object = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    cached = _STACK_SETTINGS.get(str(path))
+    if cached and cached[0] == key and key is not None:
+        return cached[1]
+    settings = _read_settings(path)
+    _STACK_SETTINGS[str(path)] = (key, settings)
+    return settings
+
+
+def load_stack_file(stack: Path) -> list[ErrorRule]:
+    settings = stack_settings(stack)
+    if settings.error:
+        raise ValueError(settings.error)
+    return settings.rules
+
+
+def yaml_value(value: object) -> str:
+    text = str(value)
+    plain = (text and text == text.strip() and re.fullmatch(r"[\w./@+-][\w ./@+,:-]*", text)
+             and ": " not in text and not text.endswith(":"))
+    return text if plain else json.dumps(text)
+
+
+def render_rule(rule_: ErrorRule) -> list[str]:
+    lines = [f"    - name: {yaml_value(rule_.name)}", f"      trigger_on: {yaml_value(rule_.trigger_text)}"]
+    if rule_.cooldown_text:
+        lines.append(f"      cooldown: {yaml_value(rule_.cooldown_text)}")
+    lines.append("      actions:")
+    for name, value, options in rule_.steps:
+        lines.append(f"        - {name}:" + (f" {yaml_value(value)}" if value else ""))
+        lines += [f"          {k}: {yaml_value(v)}" for k, v in options.items() if v is not None]
+    return lines
+
+
+def render_stack_file(settings: StackSettings) -> str:
+    lines = [STACK_FILE_HEADER, "stack:",
+             "  # false: TugBoat leaves this stack alone and drops it from the status file",
+             f"  enabled: {'true' if settings.enabled else 'false'}",
+             "  # Lower numbers start first and stop last; stacks with the same number run side by side",
+             f"  priority: {settings.priority}",
+             "  # An http(s) address, a file in this folder or an icon name; empty = TugBoat finds one",
+             "  icons:", f"    stack: {yaml_value(settings.icons.get('stack', ''))}", "    containers:"]
+    lines += [f"      {name}: {yaml_value(value)}" for name, value in sorted(settings.icons.get("containers", {}).items())]
+    lines += ["  # When the stack is not running or unhealthy: the steps run one at a time until it is healthy again",
+              "  on_error:"]
+    for rule_ in settings.rules:
+        lines += render_rule(rule_)
+    if not settings.rules:
+        lines += STACK_FILE_EXAMPLE.splitlines()
+    return "\n".join(lines) + "\n"
+
+
+def update_stack_file(stack: Path, icons: dict | None = None, replace_icons: bool = False) -> bool:
+    path = stack / STACK_FILE
+    settings = stack_settings(stack)
+    if not settings.readable:
+        return False
+    if icons is not None:
+        merged = icons if replace_icons else {
+            "stack": settings.icons.get("stack") or icons.get("stack", ""),
+            "containers": {**icons.get("containers", {}), **{k: v for k, v in settings.icons["containers"].items() if v}}}
+        if merged == settings.icons and settings.complete:
+            return False
+        settings = StackSettings(settings.enabled, settings.priority, merged, settings.rules)
+    elif settings.complete:
+        return False
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
+    try:
+        if path.exists():
+            shutil.copy2(path, ensure_parent(LAYOUT.state / "stack-files" / f"{SAFE_NAME.sub('_', stack.name)}.bak"))
+        tmp.write_text(render_stack_file(settings), encoding="utf-8")
+        owner = (path if path.exists() else stack).stat()
+        os.chmod(tmp, path.stat().st_mode if path.exists() else 0o644)
+        try:
+            os.chown(tmp, owner.st_uid, owner.st_gid)
+        except PermissionError:
+            pass
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+    _STACK_SETTINGS.pop(str(path), None)
+    return True
 
 
 def ensure_stack_file(stack: Path) -> None:
-    target = stack / STACK_FILE
-    try:
-        if target.exists():
-            return
-        target.write_text(STACK_FILE_TEMPLATE, encoding="utf-8")
-        owner = stack.stat()
-        os.chown(target, owner.st_uid, owner.st_gid)
-    except OSError:
-        pass
+    update_stack_file(stack)
+
+
+def by_priority(stacks: list[Path], reverse: bool = False) -> list[list[Path]]:
+    waves: dict[int, list[Path]] = {}
+    for stack in stacks:
+        waves.setdefault(stack_settings(stack).priority, []).append(stack)
+    return [waves[p] for p in sorted(waves, reverse=reverse)]
 
 
 def delay_work(seconds: float) -> StepWork:
@@ -3865,13 +4153,21 @@ def step_restart(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
     return res.ok, f"{res.status} (try {attempt}/{retries})"
 
 
+def webhook_values(run: ErrorRun) -> dict[str, str]:
+    return {"stack": run.stack.name, "host": platform.node(), "health": run.snap["health"], "trigger": run.trigger,
+            "rule": run.rule, "summary": run.snap["summary"], "error": "; ".join(run.snap["problems"])}
+
+
 def step_webhook(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
     if not value.startswith(("http://", "https://")):
         return False, "webhook needs an http(s) address"
-    payload = {"host": platform.node(), "stack": run.stack.name, "trigger": run.trigger,
-               "health": run.snap["health"], "summary": run.snap["summary"], "problems": run.snap["problems"],
+    values = webhook_values(run)
+    url = re.sub(r"\{(\w+)\}", lambda m: quote(values[m.group(1)], safe="") if m.group(1) in values else m.group(0), value)
+    payload = {**values, "problems": run.snap["problems"],
+               "containers": [{k: c.get(k, "") for k in ("name", "state", "health", "error")}
+                              for c in run.snap.get("containers") or [] if c.get("error") or c.get("state") != "running"],
                "steps_done": run.done, "time": now_iso(), "tugboat_version": __version__}
-    out = run.ui.step("Webhook", webhook_work(value, payload))
+    out = run.ui.step("Webhook", webhook_work(url, payload))
     return out.ok, out.note
 
 
@@ -3886,6 +4182,7 @@ def step_stack(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
                "update": lambda stack, cfg, ui: update_stack(stack, cfg, cfg.backup, ui)}
     targets = run.stacks if target.strip().lower() == "all" else [
         s for s in run.stacks if s.name.lower() == target.strip().lower()]
+    targets = [s for wave in by_priority(targets, reverse=action in ("stop", "remove")) for s in wave]
     if action not in actions or not targets:
         return False, f"use 'stack: {'|'.join(actions)} <stack name|all>'"
     failed = []
@@ -3912,7 +4209,7 @@ def step_reboot(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
         return True, "off"
     if os.geteuid() != 0:
         return False, "rebooting needs root"
-    for stack in run.stacks:
+    for stack in [s for wave in by_priority(run.stacks, reverse=True) for s in wave]:
         with stack_job(stack, 30, None):
             run.ui.out(f"  {cyan(SYM['arrow'])} stop {stack.name}")
             stop_containers(stack, run.cfg, run.ui)
@@ -3928,8 +4225,9 @@ def error_chain(stack: Path, rule_: ErrorRule, snap: dict, cfg: Config, stacks: 
                 verbose: bool, started_at: str) -> tuple[list[str], dict, dict]:
     lines: list[str] = []
     ui = Runner(verbose, False, lines)
-    run = ErrorRun(stack, cfg, ui, stacks, snap, snap["health"])
-    record = {"started_at": started_at, "trigger": run.trigger, "recovered": False, "steps": run.done}
+    run = ErrorRun(stack, cfg, ui, stacks, snap, snap["health"], rule=rule_.name)
+    record = {"started_at": started_at, "trigger": run.trigger, "rule": rule_.name, "recovered": False,
+              "steps": run.done}
     with stack_job(stack, 0, None) as free:
         if not free:
             record["skipped"] = True
@@ -4104,6 +4402,9 @@ def main() -> int:
                       help="set up the cron job that runs --healthcheck every healthcheck_interval "
                            "minutes (TugBoat also keeps it in line on every run, see manage_cron)")
     mode.add_argument("--uninstall", action="store_true", help="remove the TugBoat cron job")
+    mode.add_argument("--soft-reset", action="store_true",
+                      help="forget what TugBoat found by itself (image checks, icons, error-action records); "
+                           "settings, backups and history stay")
     mode.add_argument("--run-fixes", action="store_true",
                       help="run .TugBoat/bin/fixes.sh now (it also runs by itself whenever it changes)")
     mode.add_argument("--check-update", action="store_true",
@@ -4196,6 +4497,14 @@ def main() -> int:
                           f"{old or '(empty)'} {SYM['arrow']} {new or '(empty)'}"))
             if (added or changed) and not args.dry_run:
                 cfg = load_config(conf_path)
+        if not args.dry_run and os.geteuid() == 0:
+            try:
+                found = find_stacks(cfg.stacks_dirs, cfg.ignore_folders)
+            except OSError:
+                found = []
+            roots = [cfg.backup_root(s.name) for s in found]
+            fix_ownership(cfg.file_owner, found, roots)
+            atexit.register(lambda: fix_ownership(cfg.file_owner, found, roots))
         if cfg.icons and not args.dry_run:
             ICONS = IconStore(LAYOUT.cache / "icons", cfg.status_file.parent, cfg.icon_index_days)
         if args.uninstall:
@@ -4212,7 +4521,7 @@ def main() -> int:
         db: StatusDB | None = None if args.dry_run else StatusDB(cfg.status_file)
         startup_update_check(cfg, args.dry_run, db)
         stacks = find_stacks(cfg.stacks_dirs, cfg.ignore_folders)
-        if cfg.error_actions and not args.dry_run:
+        if not args.dry_run:
             for found_stack in stacks:
                 ensure_stack_file(found_stack)
         if cfg.manage_cron and not args.dry_run:
@@ -4222,6 +4531,9 @@ def main() -> int:
     except (OSError, ValueError) as e:
         say_error(str(e))
         return 2
+
+    if args.soft_reset:
+        return run_soft_reset(cfg, stacks, args.dry_run)
 
     if not stacks:
         say(yellow(f"No stacks found in {', '.join(map(str, cfg.stacks_dirs))}"))
@@ -4401,25 +4713,25 @@ def main() -> int:
         "update": lambda stack, runner: update_stack(stack, cfg, do_backup, runner),
     }
 
-    def run_one(stack: Path, runner: Runner) -> StackResult:
+    def run_one(stack: Path, runner: Runner, act: str) -> StackResult:
         begun = time.monotonic()
         with stack_job(stack, None if args.dry_run else STACK_LOCK_WAIT, runner) as free:
             if free:
-                res = jobs[action](stack, runner)
+                res = jobs[act](stack, runner)
             else:
                 res = StackResult(stack.name, ok=False, status="another job is still running on this stack")
                 res.errors.append(Issue(stack.name, "-", res.status))
         res.seconds = time.monotonic() - begun
         return res
 
-    def record(stack: Path, res: StackResult) -> bool:
+    def record(stack: Path, res: StackResult, act: str) -> bool:
         if not db:
             return False
         try:
             snap = res.health or check_health(stack)
             db.set_health(stack.name, snap, stack)
-            db.set_action(res, action)
-            if action == "update" and res.ok and (image_check or args.only_outdated) and not CANCEL.is_set():
+            db.set_action(res, act)
+            if act == "update" and res.ok and (image_check or args.only_outdated) and not CANCEL.is_set():
                 db.set_images(stack.name, check_images([stack], {stack.name: snap}, quiet=True, db=db)[stack.name])
             db.save()
         except OSError as e:
@@ -4438,29 +4750,34 @@ def main() -> int:
     run_start = time.monotonic()
     total = len(selected)
     workers = min(max(1, args.parallel or cfg.parallel_stacks), total)
-    if workers == 1:
-        for i, stack in enumerate(selected, 1):
-            rule(f"[{i}/{total}] {stack.name}")
-            begun = time.monotonic()
-            try:
-                res = run_one(stack, ui)
-            except KeyboardInterrupt:
-                res = interrupted_result(stack)
-                res.seconds = time.monotonic() - begun
-                interrupted = True
-            finished[stack.name] = res
-            interrupted = record(stack, res) or interrupted
-            if interrupted:
-                break
-    else:
+    if workers > 1:
         say(dim(f"  {workers} stacks at a time"))
+
+    def run_batch(batch: list[Path], act: str, done: dict[str, StackResult], label: str = "") -> bool:
+        size = min(workers, len(batch))
+        if size == 1:
+            for stack in batch:
+                rule(f"[{len(done) + 1}/{total}] {stack.name}{label}")
+                begun = time.monotonic()
+                try:
+                    res = run_one(stack, ui, act)
+                except KeyboardInterrupt:
+                    res = interrupted_result(stack)
+                    res.seconds = time.monotonic() - begun
+                    done[stack.name] = res
+                    record(stack, res, act)
+                    return True
+                done[stack.name] = res
+                if record(stack, res, act):
+                    return True
+            return False
         running: dict[str, float] = {}
 
         def job(stack: Path) -> tuple[Path, StackResult, list[str]]:
             lines: list[str] = []
             running[stack.name] = time.monotonic()
             try:
-                res = run_one(stack, Runner(args.verbose, args.dry_run, lines))
+                res = run_one(stack, Runner(args.verbose, args.dry_run, lines), act)
             except Exception as e:
                 res = StackResult(stack.name, ok=False, status="crashed")
                 res.errors.append(Issue(stack.name, "-", f"{type(e).__name__}: {e}"))
@@ -4474,40 +4791,58 @@ def main() -> int:
                 write("\r\033[K")
             if CANCEL.is_set() and not res.ok:
                 res.status = "interrupted"
-            rule(f"[{len(finished) + 1}/{total}] {stack.name}")
+            rule(f"[{len(done) + 1}/{total}] {stack.name}{label}")
             for line in lines:
                 say(line)
-            finished[stack.name] = res
+            done[stack.name] = res
 
-        pool = ThreadPoolExecutor(max_workers=workers)
-        waiting = {pool.submit(job, stack) for stack in selected}
+        stopped = False
+        pool = ThreadPoolExecutor(max_workers=size)
+        waiting = {pool.submit(job, stack) for stack in batch}
         frame = 0
         try:
             while waiting:
-                done, waiting = wait(waiting, timeout=0.1, return_when=FIRST_COMPLETED)
-                for future in sorted(done, key=lambda f: selected.index(f.result()[0])):
+                ready, waiting = wait(waiting, timeout=0.1, return_when=FIRST_COMPLETED)
+                for future in sorted(ready, key=lambda f: batch.index(f.result()[0])):
                     show(*future.result())
-                    interrupted = record(*future.result()[:2]) or interrupted
-                if interrupted:
+                    stopped = record(*future.result()[:2], act) or stopped
+                if stopped:
                     raise KeyboardInterrupt
                 if IS_TTY and waiting and running:
                     names = ", ".join(sorted(running))
-                    text = f"{len(finished)}/{total} done {SYM['bar']} running: {names}"
+                    text = f"{len(done)}/{total} done {SYM['bar']} running: {names}"
                     write(f"\r\033[K  {cyan(SPINNER[frame % len(SPINNER)])} {dim(text[:max(10, term_width() - 6)])}")
                     frame += 1
         except KeyboardInterrupt:
-            interrupted = True
+            stopped = True
             for future in waiting:
                 future.cancel()
             stop_active()
             for future in waiting:
                 if not future.cancelled():
                     show(*future.result())
-                    record(*future.result()[:2])
+                    record(*future.result()[:2], act)
         finally:
             if IS_TTY:
                 write("\r\033[K")
             pool.shutdown(wait=True)
+        return stopped
+
+    stopping = action in ("stop", "remove")
+    waves = by_priority(selected, reverse=stopping)
+    if action in ("restart", "update") and len(waves) > 1:
+        say(dim("  Stopping in priority order first"))
+        pre: dict[str, StackResult] = {}
+        for wave in by_priority(selected, reverse=True):
+            interrupted = run_batch(wave, "stop", pre, " (stop)")
+            if interrupted:
+                break
+    for wave in waves if not interrupted else []:
+        if len(waves) > 1:
+            say(dim(f"  Priority {stack_settings(wave[0]).priority}: {', '.join(s.name for s in wave)}"))
+        interrupted = run_batch(wave, action, finished)
+        if interrupted:
+            break
 
     results = [finished[s.name] for s in selected if s.name in finished]
     pending = [s.name for s in selected if s.name not in finished]
