@@ -28,11 +28,11 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.7.10"
+__version__ = "0.7.11"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -2266,7 +2266,7 @@ def local_image(image: str) -> LocalImage | None:
 def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
     info = {"status": "unknown", "local_digest": "", "remote_digest": "", "detail": "", "id": "",
             "local_version": "", "remote_version": "", "local_release_date": "", "remote_release_date": "",
-            "source_url": "", "label_icon": ""}
+            "source_url": "", "label_icon": "", "site_url": ""}
     ref = parse_image_ref(image)
     local: LocalImage | None = None
     try:
@@ -2291,6 +2291,7 @@ def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
         if local:
             info["id"] = local.id
             info["label_icon"] = next((str(local.labels[k]) for k in ICON_IMAGE_LABELS if local.labels.get(k)), "")
+            info["site_url"] = str(local.labels.get("org.opencontainers.image.url") or "").strip()
     except RegistryError as e:
         info["detail"] = str(e)
     if ref is not None:
@@ -2301,6 +2302,7 @@ def inspect_image(image: str, built: bool, prior: dict | None = None) -> dict:
 ICON_LABEL = "tugboat.icon"
 ICON_IMAGE_LABELS = ("net.unraid.docker.icon", "io.artifacthub.package.logo-url")
 ICON_FORMATS = ("svg", "png", "webp")
+HUB_LOGO_URL = "https://hub.docker.com/api/media/repos_logo/v1/{}"
 ICON_TYPES = {"image/svg+xml": "svg", "image/png": "png", "image/webp": "webp", "image/jpeg": "jpg",
               "image/gif": "gif", "image/x-icon": "ico", "image/vnd.microsoft.icon": "ico"}
 ICON_MAX_BYTES = 1024 * 1024
@@ -2468,28 +2470,93 @@ class IconStore:
                         continue
         return dict(NO_ICON)
 
-    def lookup(self, override: str, names: list[str], prior: dict) -> dict:
+    def named(self, value: str) -> dict:
         try:
-            if override.startswith(("http://", "https://")):
-                return self.download(override, "url-" + hashlib.sha1(override.encode()).hexdigest()[:12])
-            if override:
-                return self.find(icon_names(override))
-            if prior.get("icon") and (self.base / str(prior["icon"])).is_file():
-                return {"icon": str(prior["icon"]), "icon_url": str(prior.get("icon_url") or "")}
-            return self.find(names)
+            if value.startswith(("http://", "https://")):
+                return self.download(value, "url-" + hashlib.sha1(value.encode()).hexdigest()[:12])
+            return self.find(icon_names(value)) if value else dict(NO_ICON)
         except ICON_ERRORS:
             return dict(NO_ICON)
 
+    def first_download(self, urls: list[str], source: str) -> dict | None:
+        for url in urls:
+            try:
+                return dict(self.download(url, "x-" + hashlib.sha1(url.encode()).hexdigest()[:12]), icon_source=source)
+            except ICON_ERRORS:
+                continue
+        return None
+
+    def missed(self, key: str, mark: bool = False) -> bool:
+        file = self.folder / "misses.json"
+        try:
+            misses = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            misses = {}
+        if not mark:
+            return time.time() - float(misses.get(key) or 0) < ICON_MISS_SECONDS
+        misses = {k: v for k, v in misses.items() if time.time() - float(v or 0) < ICON_MISS_SECONDS}
+        misses[key] = time.time()
+        try:
+            ensure_parent(file).write_text(json.dumps(misses), encoding="utf-8")
+        except OSError:
+            pass
+        return True
+
+    def lookup(self, override: str, names: list[str], prior: dict, source_url: str = "",
+               ref: "ImageRef | None" = None, site_url: str = "") -> dict:
+        try:
+            if override:
+                found = self.named(override)
+                if found["icon"]:
+                    return dict(found, icon_source="auto")
+            if prior.get("icon") and prior.get("icon_source") not in ("logo", "stack-file") \
+                    and (self.base / str(prior["icon"])).is_file():
+                return {"icon": str(prior["icon"]), "icon_url": str(prior.get("icon_url") or ""),
+                        "icon_source": str(prior.get("icon_source") or "auto")}
+            found = self.find(names)
+            if found["icon"]:
+                return dict(found, icon_source="auto")
+            key = f"{ref.registry}/{ref.repo}" if ref else source_url
+            if self.missed(key):
+                return dict(NO_ICON)
+            found = (self.first_download(repo_logo_urls(source_url), "repository")
+                     or self.first_download(self.readme_pictures(source_url), "readme")
+                     or self.first_download(repo_logo_urls(source_url, REPO_LOGO_FOLDERS, (".png", ".svg")), "repository")
+                     or self.first_download(hub_logo_urls(ref), "docker-hub")
+                     or self.first_download(favicon_urls(site_url or source_url), "website")
+                     or self.first_download(owner_avatar_urls(source_url, ref), "owner"))
+            if found:
+                return found
+            self.missed(key, mark=True)
+            return dict(NO_ICON)
+        except ICON_ERRORS:
+            return dict(NO_ICON)
+
+    def readme_pictures(self, source_url: str) -> list[str]:
+        base = repo_raw_base(source_url)
+        if not base:
+            return []
+        for name in ("README.md", "readme.md", "README.MD"):
+            try:
+                text = self.fetch(f"{base}/{name}", 512 * 1024).decode("utf-8", "replace")
+            except ICON_ERRORS:
+                continue
+            for link in re.findall(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)|<img[^>]+src=[\"']([^\"']+)", text):
+                url = next(part for part in link if part)
+                if re.search(r"shields\.io|badge|travis|codecov|actions/workflows|\.gif(\?|$)", url, re.I):
+                    continue
+                return [url if url.startswith(("http://", "https://")) else f"{base}/{url.lstrip('./')}"]
+            return []
+        return []
+
 
 ICONS: IconStore | None = None
-STACK_LOGOS = ("logo.png", "logo.svg", "logo.webp", "logo.jpg")
+LOGO_EXTENSIONS = (".png", ".svg", ".webp", ".jpg", ".jpeg")
+SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
 
-def stack_logo(stack: Path, base: Path) -> dict | None:
-    source = next((stack / name for name in STACK_LOGOS if (stack / name).is_file()), None)
-    if source is None:
-        return None
-    target = LAYOUT.cache / "icons" / f"stack-{re.sub(r'[^A-Za-z0-9._-]', '_', stack.name)}{source.suffix.lower()}"
+def cached_logo(source: Path, key: str, base: Path) -> dict | None:
+    target = LAYOUT.cache / "icons" / f"{SAFE_NAME.sub('_', key)}{source.suffix.lower()}"
     try:
         st = source.stat()
         if not (target.is_file() and target.stat().st_size == st.st_size and target.stat().st_mtime >= st.st_mtime):
@@ -2500,7 +2567,160 @@ def stack_logo(stack: Path, base: Path) -> dict | None:
                     old.unlink(missing_ok=True)
     except OSError:
         return None
-    return {"icon": os.path.relpath(target, base), "icon_url": "", "icon_source": "logo"}
+    return {"icon": os.path.relpath(target, base), "icon_url": "", "icon_source": "logo", "icon_file": source.name}
+
+
+def logo_file(folder: Path, names: list[str]) -> Path | None:
+    return next((folder / f"{name}{ext}" for name in names for ext in LOGO_EXTENSIONS
+                 if name and (folder / f"{name}{ext}").is_file()), None)
+
+
+def stack_logo(stack: Path, base: Path) -> dict | None:
+    source = logo_file(stack, ["logo"])
+    return cached_logo(source, f"stack-{stack.name}", base) if source else None
+
+
+def stack_file_icons(stack: Path) -> dict:
+    try:
+        data = parse_yaml((stack / STACK_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    icons = data.get("icons") if isinstance(data, dict) else None
+    if not isinstance(icons, dict):
+        return {}
+    containers = icons.get("containers") if isinstance(icons.get("containers"), dict) else {}
+    return {"stack": str(icons.get("stack") or ""),
+            "containers": {str(k): str(v or "") for k, v in containers.items()}}
+
+
+def configured_icon(stack: Path, value: str, base: Path) -> dict | None:
+    value = value.strip()
+    if not value:
+        return None
+    if not value.startswith(("http://", "https://")):
+        file = (stack / value).resolve()
+        if file.is_file() and file.suffix.lower() in LOGO_EXTENSIONS and file.is_relative_to(stack.resolve()):
+            found = cached_logo(file, f"stack-{stack.name}-{file.stem}", base)
+            return dict(found, icon_source="stack-file") if found else None
+    if ICONS:
+        found = ICONS.named(value)
+    elif value.startswith(("http://", "https://")):
+        found = {"icon": "", "icon_url": value}
+    else:
+        return None
+    return dict(found, icon_source="stack-file") if found["icon"] or found["icon_url"] else None
+
+
+def icon_setting(found: dict) -> str:
+    if found.get("icon_source") == "logo":
+        return str(found.get("icon_file") or "")
+    return str(found.get("icon_url") or "")
+
+
+def save_stack_icons(stack: Path, stack_value: str, containers: dict[str, str]) -> bool:
+    path = stack / STACK_FILE
+    try:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return False
+    current = stack_file_icons(stack)
+    known = current.get("containers", {})
+    wanted_stack = current.get("stack") or stack_value
+    wanted = dict(known)
+    for name, value in containers.items():
+        if value and not wanted.get(name):
+            wanted[name] = value
+    if wanted_stack == current.get("stack", "") and wanted == known:
+        return False
+    newline = "\r\n" if "\r\n" in text else "\n"
+    block = ["icons:", f'  stack: {json.dumps(wanted_stack)}' if wanted_stack else '  stack: ""', "  containers:"]
+    block += [f"    {name}: {json.dumps(value)}" for name, value in sorted(wanted.items())]
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if re.match(r"^icons\s*:", line)), None)
+    if start is None:
+        lines = lines + ([""] if lines and lines[-1].strip() else []) + block
+    else:
+        end = next((i for i in range(start + 1, len(lines))
+                    if lines[i].strip() and not lines[i][0].isspace() and not lines[i].startswith("#")), len(lines))
+        lines[start:end] = block
+    out = newline.join(lines) + newline
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
+    try:
+        tmp.write_text(out, encoding="utf-8")
+        owner = (path if path.exists() else stack).stat()
+        os.chmod(tmp, path.stat().st_mode if path.exists() else 0o644)
+        try:
+            os.chown(tmp, owner.st_uid, owner.st_gid)
+        except PermissionError:
+            pass
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def container_icons(stack: Path, containers: list[dict], images: list[dict], base: Path) -> list[dict]:
+    settings = stack_file_icons(stack).get("containers", {})
+    only_one = len(containers) == 1
+    by_service = {s: i for i in images if isinstance(i, dict) for s in i.get("services") or []}
+    out = []
+    for c in containers:
+        names = list(dict.fromkeys(n for n in (c.get("name"), c.get("service")) if n))
+        found = container_logo(stack, names, only_one, base) or next(
+            (f for f in (configured_icon(stack, settings.get(n, ""), base) for n in names) if f), None)
+        image = by_service.get(c.get("service"), {})
+        found = found or {k: image.get(k, "") for k in ("icon", "icon_url", "icon_source")}
+        out.append(dict(c, icon=found.get("icon", ""), icon_url=found.get("icon_url", ""),
+                        icon_source=found.get("icon_source", ""), icon_file=found.get("icon_file", "")))
+    return out
+
+
+def container_logo(stack: Path, names: list[str], only_one: bool, base: Path) -> dict | None:
+    source = logo_file(stack, [*names, *(["logo"] if only_one else [])])
+    if source is None:
+        return None
+    key = f"stack-{stack.name}" if source.stem == "logo" else f"stack-{stack.name}-{source.stem}"
+    return cached_logo(source, key, base)
+
+
+SOURCE_REPO_RE = re.compile(r"^https://(github\.com|gitlab\.com)/([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+REPO_LOGO_FOLDERS = (".github", "docs", "assets")
+ICON_MISS_SECONDS = 86400
+
+
+def repo_raw_base(source_url: str) -> str:
+    match = SOURCE_REPO_RE.match(source_url.strip())
+    if not match:
+        return ""
+    host, owner, repo = match.groups()
+    return (f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD" if host == "github.com"
+            else f"https://gitlab.com/{owner}/{repo}/-/raw/HEAD")
+
+
+def repo_logo_urls(source_url: str, folders: tuple = ("",), extensions: tuple = LOGO_EXTENSIONS) -> list[str]:
+    base = repo_raw_base(source_url)
+    return [f"{base}/{folder + '/' if folder else ''}logo{ext}" for folder in folders for ext in extensions] if base else []
+
+
+def hub_logo_urls(ref: "ImageRef | None") -> list[str]:
+    return [HUB_LOGO_URL.format(quote(ref.repo, safe=""))] if ref and ref.registry == DOCKER_HUB else []
+
+
+def favicon_urls(site: str) -> list[str]:
+    host = urlsplit(site.strip()).netloc.lower() if site.strip().startswith(("http://", "https://")) else ""
+    if not host or host.endswith(("github.com", "gitlab.com", "docker.com", "docker.io", "ghcr.io", "quay.io")):
+        return []
+    return [f"https://{host}/favicon.ico"]
+
+
+def owner_avatar_urls(source_url: str, ref: "ImageRef | None") -> list[str]:
+    match = SOURCE_REPO_RE.match(source_url.strip())
+    if match and match.group(1) == "github.com":
+        return [f"https://github.com/{match.group(2)}.png"]
+    if ref and ref.registry == "ghcr.io":
+        return [f"https://github.com/{ref.repo.split('/')[0]}.png"]
+    return []
 
 
 def image_icon_names(image: str, entry: dict) -> list[str]:
@@ -2571,7 +2791,7 @@ def running_image_ids(containers: list[dict]) -> dict[str, set[str]]:
 
 
 def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False,
-                 db: "StatusDB | None" = None) -> dict[str, dict]:
+                 db: "StatusDB | None" = None, save_icons: bool | None = None) -> dict[str, dict]:
     busy = IS_TTY and not quiet
     prior = db.known_images() if db else {}
     if busy:
@@ -2579,7 +2799,10 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
 
     def gather(stack: Path) -> tuple[dict[str, dict], dict[str, set[str]]]:
         containers = snaps.get(stack.name, {}).get("containers") or []
-        return declared_images(stack, containers), running_image_ids(containers)
+        declared = declared_images(stack, containers)
+        for entry in declared.values():
+            entry["names"] += [c["name"] for c in containers if c["service"] in entry["services"] and c["name"]]
+        return declared, running_image_ids(containers)
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         gathered = dict(zip((s.name for s in stacks), pool.map(gather, stacks)))
@@ -2594,6 +2817,7 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
 
     result: dict[str, dict] = {}
     paths = {stack.name: stack for stack in stacks}
+    base = db.path.parent if db else LAYOUT.data
     for name, (declared, in_use) in gathered.items():
         images = []
         for image, entry in sorted(declared.items()):
@@ -2601,22 +2825,42 @@ def check_images(stacks: list[Path], snaps: dict[str, dict], quiet: bool = False
             image_id = info.pop("id")
             if info["status"] == "up_to_date" and in_use.get(image) and image_id not in in_use[image]:
                 info.update(status="update_available", detail="new image is pulled, containers still run the old one")
-            info.update(NO_ICON)
-            if ICONS:
-                info.update(ICONS.lookup(entry["icon"] or info["label_icon"], image_icon_names(image, entry),
-                                         prior.get(image) or {}))
+            info.update(NO_ICON, icon_source="")
+            names = list(dict.fromkeys(entry["names"]))
+            found = container_logo(paths[name], names, sum(len(e["services"]) for e in declared.values()) == 1, base)
+            if not found:
+                settings = stack_file_icons(paths[name]).get("containers", {})
+                found = next((f for f in (configured_icon(paths[name], settings.get(n, ""), base) for n in names) if f),
+                             None)
+            if not found and ICONS:
+                found = ICONS.lookup(entry["icon"] or info["label_icon"], image_icon_names(image, entry),
+                                     prior.get(image) or {}, info["source_url"], parse_image_ref(image),
+                                     info.get("site_url", ""))
+            info.update({k: v for k, v in (found or {}).items() if k in ("icon", "icon_url", "icon_source", "icon_file")})
             images.append({k: info[k] for k in ("image", "services", "status", "local_version", "remote_version",
                                                 "local_release_date", "remote_release_date",
                                                 "local_digest", "remote_digest", "source_url", "icon", "icon_url",
-                                                "detail")})
+                                                "icon_source", "detail")})
         first = first_service(paths[name]) or min((s for i in images for s in i["services"]), default="")
-        stack_icon = next(({k: i[k] for k in NO_ICON} for i in images if first in i["services"]), dict(NO_ICON))
-        stack_icon = stack_logo(paths[name], db.path.parent if db else LAYOUT.data) or stack_icon
+        containers = container_icons(paths[name], snaps.get(name, {}).get("containers") or [], images, base)
+        first_icon = next((c for c in containers if c.get("service") == first), None) or next(
+            (i for i in images if first in i["services"]), {})
+        stack_icon = (stack_logo(paths[name], base)
+                      or configured_icon(paths[name], stack_file_icons(paths[name]).get("stack", ""), base)
+                      or {k: first_icon.get(k, "") for k in (*NO_ICON, "icon_source", "icon_file")})
+        if save_icons if save_icons is not None else db is not None:
+            by_service = {s: i for i in images for s in i["services"]}
+            found = {(c["name"] or c["service"]): icon_setting(c if c.get("icon_source") == "logo" else
+                                                               by_service.get(c["service"], c))
+                     for c in containers if c.get("name") or c.get("service")}
+            if not containers:
+                found = {s: icon_setting(i) for i in images for s in i["services"]}
+            save_stack_icons(paths[name], icon_setting(stack_icon), found)
         result[name] = {
             "images": images,
             "updates_available": sum(i["status"] in IMAGE_OUTDATED for i in images),
             "images_checked_at": now_iso(),
-            **stack_icon,
+            **{k: stack_icon.get(k, "") for k in (*NO_ICON, "icon_source")},
         }
     return result
 
@@ -2723,10 +2967,14 @@ class StatusDB:
         values = {k: snapshot[k] for k in self.HEALTH_KEYS}
         if path is not None:
             values["path"] = str(path)
+            images = self.stack(name).get("images")
+            values["containers"] = [{k: v for k, v in c.items() if k != "icon_file"} for c in container_icons(
+                path, snapshot["containers"], images if isinstance(images, list) else [], self.path.parent)]
         self._set(name, values)
 
     def set_images(self, name: str, images: dict) -> None:
         keys = ("images", "updates_available", "images_checked_at", "icon", "icon_url", "icon_source")
+        images = dict(images, images=[{k: v for k, v in i.items() if k != "icon_file"} for i in images.get("images", [])])
         self._set(name, {k: images[k] for k in keys if k in images})
 
     def set_icon(self, name: str, icon: dict) -> None:
