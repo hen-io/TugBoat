@@ -21,7 +21,7 @@ The installer installs anything that is missing (Docker, Compose plugin, cron, P
 TugBoat and its `TugBoat.conf` are installed in the stacks folder. To set that folder (default `/container-data`) and the docker user (default: the user who ran `sudo`) yourself:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/hen-io/TugBoat/main/install.sh | sudo env TUGBOAT_CONTAINER_PATH=/path/to/stacks TUGBOAT_DOCKER_USER=dockeruser sh
+wget -qO- https://raw.githubusercontent.com/hen-io/TugBoat/main/install.sh | sudo env TUGBOAT_CONTAINER_PATH=/container-data TUGBOAT_DOCKER_USER=henrik sh
 ```
 
 ```sh
