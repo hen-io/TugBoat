@@ -59,7 +59,8 @@ wget -qO- https://raw.githubusercontent.com/hen-io/TugBoat/main/install.sh | sud
 | `sudo tugboat --stop --all` | Run the action on all stacks (on its own: update all) |
 | `sudo tugboat --auto` | No questions: update all stacks unless named |
 | `sudo tugboat --update --all -j 2` | Handle this many stacks at the same time (`--parallel N`) |
-| `sudo tugboat --update web --skip-backup` | Update without backing up the stack first |
+| `sudo tugboat --update web --skip-backup` | Update without backing up the stack first (also for start/restart when containers have to be created) |
+| `sudo tugboat --rollback web --no-volumes` | Leave named volumes out: not archived in backups, not restored by a rollback (the current volume data stays) |
 | `sudo tugboat --healthcheck --no-error-actions` | Do not run the error actions from the stacks' `TugBoat.stack` files |
 | `sudo tugboat --healthcheck --no-image-check` | Do not check the registries for new image versions |
 | `sudo tugboat --healthcheck --check-images` | Check the registries now, even if `image_check_interval` has not passed |
@@ -78,8 +79,10 @@ Settings are in `TugBoat.conf` in the scripts root folder. Missing settings are 
 | --- | --- | --- |
 | `container_path` | `/container-data` | Folder that holds one sub-folder per stack |
 | `docker_user` | (none) | Run docker commands as this user |
-| `backup` / `backup_retention` | `true` / `15` | Back up a stack before updating, and how many backups to keep (`0` = keep all) |
+| `backup` / `backup_retention` | `true` / `15` | Back up the stack folder before an update (after the stop), before containers are created (start/restart), and before a rollback; and how many backups to keep (`0` = keep all) |
 | `backup_large_mb` / `backup_large_retention` | `250` / `5` | If a stack's newest backup is bigger than this many MB, keep only this many backups instead of `backup_retention` (`0` = off) |
+| `backup_exclude` | (none) | Left out of every backup and kept on a rollback, one `- "pattern"` per line, relative to the stack folder (`cache`, `*.log`, `data/tmp`; `volume:NAME` leaves out a named volume) |
+| `backup_volumes` | `true` | Also archive the stack's named Docker volumes (`.tar.gz` in the backup's `.tugboat-volumes` folder) and restore them on a rollback; external volumes are left alone |
 | `ignore_folders` | (none) | Comma-separated stack folders to leave alone |
 | `image_prune` | `all` | After an update, delete: `all` = every unused image (`docker image prune -a -f`, once after all stacks), `old` = only the stack's previous images, `off` = nothing |
 | `image_check_interval` | `60` | Minutes between checks for new images |
@@ -100,6 +103,10 @@ Every stack folder gets a `TugBoat.stack` file. TugBoat adds any setting that is
 | --- | --- | --- |
 | `stack.enabled` | `true` | `false` = TugBoat ignores this stack and drops it from the status file |
 | `stack.priority` | `1` | Lower numbers start first and stop last; stacks with the same number run side by side |
+| `stack.backup` | `default` | `true` / `false`: back up this stack before an update; `default` follows `backup` in `TugBoat.conf` |
+| `stack.backup_volumes` | `default` | `true` / `false`: archive this stack's named volumes; `default` follows `backup_volumes` in `TugBoat.conf` |
+| `stack.backup_exclude` | (none) | More patterns left out of this stack's backups (added to `backup_exclude`) |
+| `stack.update` | `true` | `false` = `--update --all` and `--auto` skip this stack; naming it still updates it |
 | `stack.icons.stack` | (found) | Icon of the stack: an http(s) address, a file in the stack folder or an icon name |
 | `stack.icons.containers.<name>` | (found) | Icon of one container, same values as above |
 | `stack.on_error` | (none) | List of rules that run when the stack is not running or unhealthy |
@@ -108,8 +115,8 @@ Every stack folder gets a `TugBoat.stack` file. TugBoat adds any setting that is
 | `on_error[].cooldown` | `1h` | Time before the rule may run again (`30s`, `10m`, `1h`) |
 | `on_error[].actions` | (none) | Steps, run one at a time; stops as soon as the stack is healthy |
 | `- restart:` | | Restart the stack; options `retries` (default `1`) and `retry_delay` |
-| `- webhook: URL` | | POST the stack's state as JSON; the URL can use `{stack}` `{host}` `{health}` `{trigger}` `{rule}` `{summary}` `{error}` |
+| `- webhook: URL` | | POST the stack's state as JSON; the URL can use `{stack}` `{host}` `{health}` `{trigger}` `{rule}` `{summary}` `{error}`; options `method` (`POST`, `PUT`, `GET`) and `headers` (a map, values can use the same variables) |
 | `- delay: 5s` | | Wait |
 | `- stack: restart other` | | `start`, `stop`, `restart`, `update` or `remove` another stack (or `all`) |
-| `- script: ./fix.sh` | | Run a script in the stack folder (gets `TUGBOAT_STACK`, `TUGBOAT_HEALTH`, `TUGBOAT_PROBLEMS` ...) |
+| `- script: ./fix.sh` | | Run a command in the stack folder, with the rights of the owner of `TugBoat.stack` (gets `TUGBOAT_STACK`, `TUGBOAT_HEALTH`, `TUGBOAT_PROBLEMS` ...) |
 | `- reboot-host: true` | | Stop all stacks and reboot the host |

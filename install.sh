@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-RAW="${TUGBOAT_RAW:-https://raw.githubusercontent.com/hen-io/TugBoat/main}"
+REPO="hen-io/TugBoat"
+RAW="${TUGBOAT_RAW:-https://raw.githubusercontent.com/$REPO/main}"
 DIR="${TUGBOAT_CONTAINER_PATH:-/container-data}"
 LINK="${TUGBOAT_LINK:-/usr/local/bin/tugboat}"
 
@@ -80,6 +81,14 @@ set_conf() {
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+if [ -z "${TUGBOAT_RAW:-}" ] && fetch "https://api.github.com/repos/$REPO/releases/latest" "$TMP/release.json"; then
+    TAG="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/release.json" | head -n 1)"
+    case "$TAG" in
+        ''|*[!A-Za-z0-9._-]*) say "No release found - installing from main" ;;
+        *) RAW="https://raw.githubusercontent.com/$REPO/$TAG" ;;
+    esac
+fi
 
 say "Downloading TugBoat from $RAW"
 fetch "$RAW/TugBoat.py" "$TMP/TugBoat.py" || fail "could not download TugBoat.py"

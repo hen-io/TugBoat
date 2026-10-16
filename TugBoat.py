@@ -6,6 +6,7 @@ import atexit
 import base64
 import difflib
 import fcntl
+import fnmatch
 import functools
 import grp
 import hashlib
@@ -19,6 +20,7 @@ import shlex
 import shutil
 import signal
 import stat
+import tarfile
 import subprocess
 import sys
 import threading
@@ -35,7 +37,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 __title__ = "TugBoat"
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 __author__ = "Henrik Isefjær Olsen"
 __git__ = "https://github.com/hen-io/TugBoat"
 
@@ -49,6 +51,8 @@ CONFIG_DEFAULTS = {
     "backup_retention": "15",
     "backup_large_mb": "250",
     "backup_large_retention": "5",
+    "backup_exclude": "",
+    "backup_volumes": "true",
     "docker_user": "",
     "file_owner": "1000:1000",
     "health_wait": "60",
@@ -77,11 +81,15 @@ CONFIG_HELP = {
     "require_root": "Restart with sudo when not run as root (true/false)",
     "status_file": "Path of the status JSON file",
     "ignore_folders": "Stack folders to skip, one '- \"name\"' per line",
-    "backup": "Back up a stack before updating it (true/false)",
+    "backup": "Back up a stack before an update, before creating its containers and before a rollback (true/false)",
     "backup_path": "Backup folder ($STACK-NAME = the stack's name)",
     "backup_retention": "Backups to keep per stack (count, 0 = all)",
     "backup_large_mb": "Size from which a backup counts as large (MB, 0 = off)",
     "backup_large_retention": "Backups to keep when the newest one is large (count)",
+    "backup_volumes": "Also archive the stack's named Docker volumes (tar.gz) in each backup and restore them on a "
+                      "rollback (true/false)",
+    "backup_exclude": "Left out of every backup and kept on a rollback, one '- \"pattern\"' per line "
+                      "(relative to the stack folder, e.g. \"cache\", \"*.log\"; \"volume:NAME\" = a named volume)",
     "docker_user": "User that runs the docker commands (empty = the user running TugBoat)",
     "file_owner": "Owner of the files TugBoat writes (user:group, names or IDs)",
     "health_wait": "Longest wait for containers to become healthy after a start (seconds)",
@@ -108,7 +116,8 @@ CONFIG_HELP = {
 }
 CONFIG_GROUPS = (
     ("stacks_directory", "require_root", "status_file", "ignore_folders"),
-    ("backup", "backup_path", "backup_retention", "backup_large_mb", "backup_large_retention"),
+    ("backup", "backup_path", "backup_retention", "backup_large_mb", "backup_large_retention", "backup_volumes",
+     "backup_exclude"),
     ("docker_user", "file_owner", "health_wait", "command_timeout", "parallel_stacks", "error_actions"),
     ("image_check", "image_check_interval", "registry_timeout", "image_prune"),
     ("icons", "icon_index_days"),
@@ -232,7 +241,7 @@ PREVIOUS_HELP = {
     ],
 }
 PINNED_CONFIG_KEYS = ("stacks_directory", "status_file", "backup_path")
-LIST_CONFIG_KEYS = ("stacks_directory", "ignore_folders")
+LIST_CONFIG_KEYS = ("stacks_directory", "ignore_folders", "backup_exclude")
 BUILTIN_STACK_DIRS = (".", "./Stacks", "./stacks", "./Stack")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -260,10 +269,13 @@ CONFIG_FILE = LAYOUT.config
 
 
 def owned_paths(stacks: list[Path], backup_roots: list[Path]) -> list[Path]:
-    paths = [Path(__file__).resolve(), *(s / STACK_FILE for s in stacks)]
+    paths = [s / STACK_FILE for s in stacks]
     skip = {os.path.realpath(r) for r in backup_roots}
     for root, dirs, files in os.walk(LAYOUT.data):
         rel = Path(root).relative_to(LAYOUT.data).parts
+        if rel[:1] == ("bin",):
+            dirs[:] = []
+            continue
         paths.append(Path(root))
         if (rel[:1] == ("backups",) and len(rel) == 2) or os.path.realpath(root) in skip:
             dirs[:] = []
@@ -553,9 +565,28 @@ class Runner:
         return StepOutcome(ok is True, status == "warn", note, details, output, seconds)
 
 
-def command_work(cmd: str, cwd: Path, env: dict | None = None, as_root: bool = False) -> StepWork:
+def owner_run_as(path: Path) -> dict | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if os.geteuid() != 0 or (st.st_uid == 0 and not st.st_mode & 0o002):
+        return None
+    uid = st.st_uid if st.st_uid else 65534
+    try:
+        pw = pwd.getpwuid(uid)
+        name, gid, home, groups = pw.pw_name, pw.pw_gid, pw.pw_dir, os.getgrouplist(pw.pw_name, pw.pw_gid)
+    except KeyError:
+        name, gid, home, groups = str(uid), st.st_gid, "/", [st.st_gid]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SUDO_")}
+    env.update(HOME=home, USER=name, LOGNAME=name)
+    return {"user": uid, "group": gid, "extra_groups": groups, "env": env}
+
+
+def command_work(cmd: str, cwd: Path, env: dict | None = None, as_root: bool = False,
+                 run_as_user: dict | None = None) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
-        run_as = {} if as_root else dict(DOCKER_RUN_AS)
+        run_as = dict(run_as_user) if run_as_user is not None else {} if as_root else dict(DOCKER_RUN_AS)
         if env:
             run_as["env"] = {**(run_as.get("env") or os.environ), **env}
         proc = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE,
@@ -635,8 +666,8 @@ def run_fixes(verbose: bool, force: bool = False) -> bool | None:
         env = {"TUGBOAT_DIR": str(SCRIPT_DIR), "TUGBOAT_DATA": str(LAYOUT.data),
                "TUGBOAT_CONFIG": str(CONFIG_FILE), "TUGBOAT_VERSION": __version__}
         out = Runner(verbose, False).step(
-            "Fixes", command_work(f"sh {shlex.quote(str(LAYOUT.fixes))}", SCRIPT_DIR, env=env, as_root=True),
-            timeout=600)
+            "Fixes", command_work(f"sh {shlex.quote(str(LAYOUT.fixes))}", SCRIPT_DIR, env=env, as_root=True,
+                                  run_as_user=owner_run_as(LAYOUT.fixes)), timeout=600)
         for line in [] if verbose else out.output[-ERROR_TAIL_LINES:]:
             say(dim(f"      {SYM['bar']} {line}"))
         try:
@@ -720,6 +751,11 @@ def install_release(rel: dict, dry_run: bool) -> bool:
         say_error(f"Download failed: {getattr(e, 'reason', e)}")
         return False
 
+    expected = release_checksum(rel, script.name)
+    if expected and hashlib.sha256(raw).hexdigest() != expected:
+        say_error("Downloaded file does not match the release's SHA-256 checksum - aborting")
+        return False
+
     m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
     if not m:
         say_error("Downloaded file has no __version__ - not a TugBoat script, aborting")
@@ -732,15 +768,54 @@ def install_release(rel: dict, dry_run: bool) -> bool:
     except SyntaxError as e:
         say_error(f"Downloaded file has a syntax error (line {e.lineno}) - aborting")
         return False
-    say(f"  {green(SYM['ok'])} Verified {m.group(1)}")
+    say(f"  {green(SYM['ok'])} Verified {m.group(1)}" + (" (SHA-256)" if expected else ""))
 
     if dry_run:
         say(cyan(f"  {SYM['dry']} Dry run - would replace {script}"))
         return True
 
+    with file_lock(LAYOUT.state / "update.lock"):
+        if script_version(script) == m.group(1):
+            say(f"  {green(SYM['ok'])} Already installed by another TugBoat run")
+            return True
+        if not replace_script(script, raw):
+            return False
+    say(f"  {green(SYM['ok'])} Installed {bold(rel['tag'])}  {dim(f'(old version kept as script-{__version__}.bak)')}")
+    fetch_shipped(rel["tag"])
+    show_new_settings(rel["tag"])
+    return True
+
+
+CHECKSUM_RE = re.compile(r"\b([0-9a-f]{64})\b", re.I)
+
+
+def release_checksum(rel: dict, name: str) -> str:
+    assets = {k.lower(): v for k, v in rel["assets"].items()}
+    url = next((assets[k] for k in (f"{name.lower()}.sha256", "tugboat.py.sha256", "sha256sums", "sha256sums.txt")
+                if assets.get(k)), "")
+    if not url:
+        return ""
+    try:
+        text = http_get(url, 10).decode("utf-8", "replace")
+    except (URLError, OSError, HTTPException):
+        return ""
+    lines = [l for l in text.splitlines() if name.lower() in l.lower()] or text.splitlines()
+    found = next((m.group(1).lower() for m in map(CHECKSUM_RE.search, lines) if m), "")
+    return found
+
+
+def script_version(path: Path) -> str:
+    try:
+        m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', path.read_text(encoding="utf-8-sig"), re.M)
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
+def replace_script(script: Path, raw: bytes) -> bool:
     st = script.stat()
     backup = LAYOUT.state / f"script-{__version__}.bak"
-    tmp = script.with_name(f".{script.name}.new")
+    tmp = script.with_name(f".{script.name}.{os.getpid()}.new")
     try:
         shutil.copy2(script, ensure_parent(backup))
         tmp.write_bytes(raw)
@@ -766,18 +841,24 @@ def install_release(rel: dict, dry_run: bool) -> bool:
         tmp.unlink(missing_ok=True)
         say_error(f"Could not replace {script}: {e}")
         return False
-    say(f"  {green(SYM['ok'])} Installed {bold(rel['tag'])}  {dim(f'(old version kept as {backup.name})')}")
+    return True
+
+
+def fetch_shipped(tag: str) -> None:
     for shipped in SHIPPED_FILES:
         try:
-            data = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/{shipped}", 10)
+            data = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{tag}/{shipped}", 10)
             if data.strip():
                 target = SCRIPT_DIR / shipped
-                tmp_file = ensure_parent(target).with_name(target.name + ".new")
+                tmp_file = ensure_parent(target).with_name(f"{target.name}.{os.getpid()}.new")
                 tmp_file.write_bytes(data)
                 os.replace(tmp_file, target)
         except (URLError, OSError, HTTPException):
             pass
 
+
+def show_new_settings(tag: str) -> None:
+    rel = {"tag": tag}
     try:
         example = http_get(f"{GITHUB_RAW}/{GITHUB_REPO}/{rel['tag']}/.TugBoat/TugBoat.conf", 10).decode("utf-8")
         local = (set(_conf_keys(CONFIG_FILE.read_text(encoding="utf-8")))
@@ -786,10 +867,9 @@ def install_release(rel: dict, dry_run: bool) -> bool:
         if new_keys:
             say(yellow(f"  {SYM['warn']} New config settings (added to your config on the next run): "
                        f"{', '.join(new_keys)}"))
-            say(dim(f"    see {__git__}/blob/{rel['tag']}/TugBoat.conf"))
+            say(dim(f"    see {__git__}/blob/{rel['tag']}/.TugBoat/TugBoat.conf"))
     except (URLError, OSError, HTTPException, UnicodeDecodeError):
         pass
-    return True
 
 
 def print_release_notes(rel: dict, max_lines: int = 15) -> None:
@@ -876,6 +956,8 @@ class Config:
     backup_retention: int
     backup_large_mb: int
     backup_large_retention: int
+    backup_exclude: list[str]
+    backup_volumes: bool
     ignore_folders: set[str]
     require_root: bool
     status_file: Path
@@ -900,6 +982,7 @@ class Config:
     healthcheck_mode: str
     live_mode: str
     live_interval: int
+    no_volumes: bool = False
 
     def backup_root(self, stack: str) -> Path:
         return Path(self.backup_path.replace(STACK_PLACEHOLDER, stack))
@@ -1081,7 +1164,17 @@ def render_default_config(newline: str = "\r\n") -> str:
                         for group in CONFIG_GROUPS)
 
 
+CONFIG_LOCK = LAYOUT.state / "config.lock"
+
+
 def sync_config(path: Path, write: bool = True) -> tuple[list[str], list[tuple[str, str, str]]]:
+    if not write:
+        return _sync_config(path, write)
+    with file_lock(CONFIG_LOCK):
+        return _sync_config(path, write)
+
+
+def _sync_config(path: Path, write: bool) -> tuple[list[str], list[tuple[str, str, str]]]:
     exists = path.is_file()
     text = path.read_bytes().decode("utf-8") if exists else render_default_config()
     created = not exists
@@ -1167,6 +1260,11 @@ def set_config_value(path: Path, key: str, values: list[str]) -> tuple[str, str]
         raise ValueError(f"unknown setting '{key}'" + (f" - did you mean {close[0]}?" if close else
                                                          " (see the settings in " + path.name + ")"))
     sync_config(path)
+    with file_lock(CONFIG_LOCK):
+        return _set_config_value(path, key, values)
+
+
+def _set_config_value(path: Path, key: str, values: list[str]) -> tuple[str, str]:
     text = path.read_bytes().decode("utf-8")
     raw = parse_config_text(text, path.name)
     newline = "\r\n" if "\r\n" in text else "\n"
@@ -1278,6 +1376,8 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         backup_retention=_parse_int(get("backup_retention"), "backup_retention"),
         backup_large_mb=_parse_int(get("backup_large_mb"), "backup_large_mb"),
         backup_large_retention=_parse_int(get("backup_large_retention"), "backup_large_retention"),
+        backup_exclude=clean_patterns(config_list(raw, "backup_exclude")),
+        backup_volumes=_parse_bool(get("backup_volumes"), "backup_volumes"),
         ignore_folders={os.path.basename(n.strip().rstrip("/")).lower() for n in config_list(raw, "ignore_folders")
                         if n.strip().rstrip("/")},
         require_root=_parse_bool(get("require_root"), "require_root"),
@@ -1292,8 +1392,8 @@ def load_config(path: Path, base: Path = SCRIPT_DIR) -> Config:
         image_prune=parse_choice(get("image_prune"), "image_prune", IMAGE_PRUNE_MODES),
         command_timeout=_parse_int(get("command_timeout"), "command_timeout"),
         manage_cron=_parse_bool(get("manage_cron"), "manage_cron"),
-        healthcheck_interval=_parse_int(get("healthcheck_interval"), "healthcheck_interval"),
-        update_check_seconds=_parse_int(get("update_check_seconds"), "update_check_seconds"),
+        healthcheck_interval=max(1, _parse_int(get("healthcheck_interval"), "healthcheck_interval")),
+        update_check_seconds=max(60, _parse_int(get("update_check_seconds"), "update_check_seconds")),
         registry_timeout=max(1, _parse_int(get("registry_timeout"), "registry_timeout")),
         install_dependencies=_parse_bool(get("install_dependencies"), "install_dependencies"),
         icons=_parse_bool(get("icons"), "icons"),
@@ -1942,6 +2042,7 @@ def describe_live(cfg: Config, state: str, note: str, dry_run: bool = False) -> 
 
 LIVE_EVENTS = ("start", "restart", "die", "stop", "oom", "pause", "unpause", "destroy", "health_status")
 LIVE_DEBOUNCE = 1.5
+LIVE_MIN_GAP = 3.0
 LIVE_FALLBACK_SECONDS = 60
 LIVE_RECONNECT_SECONDS = (5, 60)
 LIVE_RESTART_CODE = 3
@@ -1999,6 +2100,7 @@ class LiveWatch:
         self.proc: subprocess.Popen | None = None
         self.last_fallback = 0.0
         self.backoff = LIVE_RECONNECT_SECONDS[0]
+        self.last_check = 0.0
         self.full: subprocess.Popen | None = None
         self.full_at = time.monotonic() + LIVE_FIRST_FULL_CHECK
         self.script, self.conf = Path(__file__).resolve(), config_source()
@@ -2039,7 +2141,9 @@ class LiveWatch:
         fallback = self.cfg.live_mode == "events" or now - self.last_fallback >= LIVE_FALLBACK_SECONDS
         if fallback:
             self.last_fallback = now
-        stacks = [s for s in find_stacks(self.cfg.stacks_dirs, self.cfg.ignore_folders) if not stack_busy(s.name)]
+        self.last_check = now
+        stacks = [s for s in find_stacks(self.cfg.stacks_dirs, self.cfg.ignore_folders, quiet=True)
+                  if not stack_busy(s.name)]
         snaps = check_all(stacks, fallback=fallback)
         changed = [s for s in stacks if s.name in snaps and self.seen.get(s.name) != health_print(snaps[s.name])]
         db = StatusDB(self.cfg.status_file)
@@ -2071,7 +2175,7 @@ class LiveWatch:
             self.log(f"{name}: running its error actions")
             try:
                 self.fixers[name] = subprocess.Popen(
-                    [sys.executable, str(self.script), "--healthcheck", name, "--no-image-check"],
+                    [sys.executable, str(self.script), "--healthcheck", f"--stack={name}", "--no-image-check"],
                     stdin=subprocess.DEVNULL, start_new_session=True)
             except OSError as e:
                 self.log(f"{name}: could not start the error actions: {e}")
@@ -2103,7 +2207,13 @@ class LiveWatch:
             if cfg.healthcheck_mode != "live":
                 self.log("healthcheck_mode is not live - stopping")
                 return 0
-            if cfg.live_mode != self.cfg.live_mode:
+            if cfg.docker_user != self.cfg.docker_user:
+                try:
+                    setup_docker_user(cfg.docker_user)
+                except (ValueError, PermissionError) as e:
+                    self.log(f"docker_user not changed: {e}")
+                    cfg = replace(cfg, docker_user=self.cfg.docker_user)
+            if cfg.live_mode != self.cfg.live_mode or cfg.docker_user != self.cfg.docker_user:
                 self.stop()
             self.cfg = cfg
             self.log(f"config reloaded (live_mode: {cfg.live_mode})")
@@ -2139,7 +2249,8 @@ class LiveWatch:
                             self.log(f"event: {event['Actor']['Attributes'].get('name', '?')} {event.get('Action', '')}")
                         except (ValueError, KeyError, TypeError):
                             pass
-                    due_at = min(due_at, time.monotonic() + LIVE_DEBOUNCE) if due_at else time.monotonic() + LIVE_DEBOUNCE
+                    soon = time.monotonic() + LIVE_DEBOUNCE
+                    due_at = max(min(due_at, soon) if due_at else soon, self.last_check + LIVE_MIN_GAP)
                 if due_at and time.monotonic() >= due_at:
                     due_at = time.monotonic() + self.cfg.live_interval if self.cfg.live_mode == "interval" else 0.0
                     try:
@@ -2179,11 +2290,11 @@ def run_watch(cfg: Config, verbose: bool, dry_run: bool) -> int:
         handle.close()
 
 
-def find_stacks(roots: list[Path], ignore: set[str] = frozenset()) -> list[Path]:
+def find_stacks(roots: list[Path], ignore: set[str] = frozenset(), quiet: bool = False) -> list[Path]:
     existing = [root for root in roots if root.is_dir()]
     if not existing:
         raise FileNotFoundError(f"stacks_directory does not exist: {', '.join(map(str, roots))}")
-    for root in roots:
+    for root in roots if not quiet else []:
         if root not in existing:
             say(yellow(f"{SYM['warn']} stacks_directory not found, skipped: {root}"))
     found: dict[str, Path] = {}
@@ -2194,6 +2305,8 @@ def find_stacks(roots: list[Path], ignore: set[str] = frozenset()) -> list[Path]
                     and any((d / f).is_file() for f in COMPOSE_FILES)) or not stack_settings(d).enabled:
                 continue
             if d.name in found:
+                if quiet:
+                    continue
                 say(yellow(f"{SYM['warn']} Stack '{d.name}' in {root} skipped: "
                            f"{found[d.name].parent} already has a stack with that name"))
                 continue
@@ -2332,6 +2445,223 @@ def backup_inside_stack(stack: Path, cfg: Config) -> bool:
         return False
 
 
+def clean_patterns(patterns: list[str]) -> list[str]:
+    out = []
+    for p in patterns:
+        p = str(p).strip().replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        p = p.strip("/")
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def excluded(rel: str, patterns: list[str]) -> bool:
+    rel = rel.replace(os.sep, "/")
+    name = rel.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatchcase(rel, p) or ("/" not in p and fnmatch.fnmatchcase(name, p)) for p in patterns)
+
+
+def backup_excludes(stack: Path, cfg: "Config") -> list[str]:
+    return clean_patterns([*cfg.backup_exclude, *stack_settings(stack).backup_exclude])
+
+
+def wants_backup(stack: Path, cfg: "Config", skip: bool = False) -> bool:
+    choice = stack_settings(stack).backup
+    return not skip and (cfg.backup if choice == "default" else choice == "true")
+
+
+VOLUME_DIR = ".tugboat-volumes"
+VOLUME_MANIFEST = "volumes.json"
+VOLUME_HELPER_IMAGE = "busybox:stable"
+VOLUME_TIMEOUT = 6 * 3600
+
+
+def wants_volumes(stack: Path, cfg: "Config") -> bool:
+    choice = stack_settings(stack).backup_volumes
+    return not cfg.no_volumes and (cfg.backup_volumes if choice == "default" else choice == "true")
+
+
+def stack_volumes(stack: Path) -> tuple[str, list[dict], list[str]] | None:
+    rc, out, _ = docker(["compose", "config", "--format", "json"], cwd=stack)
+    try:
+        config = json.loads(out) if rc == 0 else None
+    except ValueError:
+        config = None
+    if not isinstance(config, dict):
+        return None
+    project = str(config.get("name") or compose_project_name(stack.name))
+    volumes, external = [], []
+    for key, spec in (config.get("volumes") or {}).items():
+        spec = spec if isinstance(spec, dict) else {}
+        name = str(spec.get("name") or f"{project}_{key}")
+        (external.append(name) if spec.get("external") else volumes.append({"key": str(key), "name": name}))
+    return project, volumes, external
+
+
+def volume_info(name: str) -> dict | None:
+    rc, out, _ = docker(["volume", "inspect", name], timeout=30)
+    try:
+        data = json.loads(out) if rc == 0 else None
+    except ValueError:
+        return None
+    return data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+
+def volume_excluded(volume: dict, patterns: list[str]) -> bool:
+    names = (volume["key"], volume["name"])
+    return any(p.startswith("volume:") and any(fnmatch.fnmatchcase(n, p[7:]) for n in names) for p in patterns)
+
+
+def direct_path(info: dict, write: bool = False) -> str:
+    mount = str(info.get("Mountpoint") or "")
+    wanted = os.R_OK | os.X_OK | (os.W_OK if write else 0)
+    return mount if info.get("Driver", "local") == "local" and mount and os.access(mount, wanted) else ""
+
+
+def archive_volume(name: str, info: dict, file: Path) -> str:
+    mount = direct_path(info)
+    if mount:
+        def keep(member: tarfile.TarInfo) -> tarfile.TarInfo:
+            if cancelled():
+                raise InterruptedError("cancelled")
+            return member
+        with tarfile.open(file, "w:gz", compresslevel=1) as tar:
+            tar.add(mount, arcname=".", filter=keep)
+        return "direct"
+    rc, _, err = docker(["run", "--rm", "--network", "none", "-v", f"{name}:/volume:ro", "-v", f"{file.parent}:/backup",
+                         VOLUME_HELPER_IMAGE, "tar", "-czf", f"/backup/{file.name}", "-C", "/volume", "."],
+                        timeout=VOLUME_TIMEOUT)
+    if rc != 0:
+        raise RuntimeError(f"{name}: {_last_line(err, f'helper container exit code {rc}')}")
+    return "helper"
+
+
+def fmt_size(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def volume_backup_work(stack: Path, dest: Path, excludes: list[str], also: list[dict] | None = None) -> StepWork:
+    def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        found = stack_volumes(stack)
+        if found is None:
+            return False, "could not read the compose file", []
+        project, volumes, external = found
+        names = {v["name"] for v in volumes}
+        volumes += [{"key": str(v.get("key") or v["name"]), "name": str(v["name"])}
+                    for v in also or [] if v["name"] not in names]
+        volumes = [v for v in volumes if not volume_excluded(v, excludes)]
+        if not volumes:
+            return True, "no named volumes" + (f" (external, not saved: {', '.join(external)})" if external else ""), []
+        folder = dest / VOLUME_DIR
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        saved, missing, total = [], [], 0
+        try:
+            for volume in volumes:
+                info = volume_info(volume["name"])
+                if info is None:
+                    missing.append(volume["name"])
+                    continue
+                file = folder / f"{SAFE_NAME.sub('_', volume['key'])}.tar.gz"
+                emit(f"archiving volume {volume['name']}")
+                mode = archive_volume(volume["name"], info, file)
+                os.chmod(file, 0o600)
+                total += file.stat().st_size
+                saved.append({**volume, "file": file.name, "driver": str(info.get("Driver") or "local"), "how": mode,
+                              "labels": info.get("Labels") if isinstance(info.get("Labels"), dict) else {}})
+            (folder / VOLUME_MANIFEST).write_text(json.dumps({"project": project, "volumes": saved}, indent=2) + "\n",
+                                                  encoding="utf-8")
+        except (OSError, RuntimeError, tarfile.TarError) as e:
+            return False, "cancelled" if cancelled() else str(e), []
+        note = f"{len(saved)} volume(s), {fmt_size(total)}"
+        if missing:
+            note += f" (not created yet: {', '.join(missing)})"
+        if external:
+            note += f" (external, not saved: {', '.join(external)})"
+        return True, note, []
+    return work
+
+
+def safe_member(member: tarfile.TarInfo, dest: str) -> tarfile.TarInfo:
+    root = os.path.realpath(dest)
+
+    def inside(path: str) -> bool:
+        return os.path.commonpath([root, os.path.realpath(path)]) == root
+    if not inside(os.path.join(root, member.name)):
+        raise tarfile.TarError(f"{member.name}: outside the volume - archive refused")
+    if member.islnk() and not inside(os.path.join(root, member.linkname)):
+        raise tarfile.TarError(f"{member.name}: hard link outside the volume - archive refused")
+    if member.ischr() or member.isblk():
+        raise tarfile.TarError(f"{member.name}: device file - archive refused")
+    return member
+
+
+def extract_safely(file: Path, dest: str) -> None:
+    with tarfile.open(file, "r:gz") as tar:
+        for member in tar:
+            if cancelled():
+                raise InterruptedError("cancelled")
+            safe_member(member, dest)
+            if hasattr(tarfile, "data_filter"):
+                tar.extract(member, dest, numeric_owner=True, filter="fully_trusted")
+            else:
+                tar.extract(member, dest, numeric_owner=True)
+
+
+def restore_volume(volume: dict, file: Path) -> str:
+    name = volume["name"]
+    info = volume_info(name)
+    if info is None:
+        labels = [x for k, v in (volume.get("labels") or {}).items() for x in ("--label", f"{k}={v}")]
+        rc, _, err = docker(["volume", "create", *labels, name], timeout=60)
+        info = volume_info(name) if rc == 0 else None
+        if info is None:
+            raise RuntimeError(f"{name}: could not create the volume ({_last_line(err, 'no error message')})")
+    mount = direct_path(info, write=True)
+    if mount:
+        clear_folder(Path(mount), Path(mount), [])
+        extract_safely(file, mount)
+        return name
+    script = f"rm -rf /volume/..?* /volume/.[!.]* /volume/*; tar -xzf /backup/{shlex.quote(file.name)} -C /volume"
+    rc, _, err = docker(["run", "--rm", "--network", "none", "-v", f"{name}:/volume", "-v", f"{file.parent}:/backup:ro",
+                         VOLUME_HELPER_IMAGE, "sh", "-c", script], timeout=VOLUME_TIMEOUT)
+    if rc != 0:
+        raise RuntimeError(f"{name}: {_last_line(err, f'helper container exit code {rc}')}")
+    return name
+
+
+def backup_volumes_of(backup: Path) -> list[dict]:
+    try:
+        data = json.loads((backup / VOLUME_DIR / VOLUME_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    volumes = data.get("volumes") if isinstance(data, dict) else None
+    return [v for v in volumes if isinstance(v, dict) and v.get("name") and v.get("file")
+            and "/" not in str(v["file"]) and str(v["file"]) not in (".", "..")] if isinstance(volumes, list) else []
+
+
+def volume_restore_work(backup: Path, excludes: list[str]) -> StepWork:
+    def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        volumes = [v for v in backup_volumes_of(backup) if not volume_excluded(
+            {"key": str(v.get("key") or ""), "name": str(v["name"])}, excludes)]
+        if not volumes:
+            return True, "no volume archives in this backup", []
+        done = []
+        try:
+            for volume in volumes:
+                emit(f"restoring volume {volume['name']}")
+                done.append(restore_volume(volume, backup / VOLUME_DIR / str(volume["file"])))
+        except (OSError, RuntimeError, tarfile.TarError) as e:
+            return False, "cancelled" if cancelled() else str(e), [f"restored: {', '.join(done) or 'none'}"]
+        return True, f"{len(done)} volume(s)", []
+    return work
+
+
 def _is_special(path: str) -> bool:
     try:
         mode = os.lstat(path).st_mode
@@ -2365,17 +2695,25 @@ def _copy_dir_owners(src: Path, dest: Path) -> None:
                 pass
 
 
-def backup_work(stack: Path, dest: Path) -> StepWork:
+def backup_work(stack: Path, dest: Path, excludes: list[str] | None = None) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
         emit(f"copying {stack} -> {dest}")
         skipped: list[str] = []
+        left_out: list[str] = []
 
         def ignore(folder: str, names: list[str]) -> list[str]:
             special = [n for n in names if _is_special(os.path.join(folder, n))]
             for n in special:
                 skipped.append(os.path.join(folder, n))
                 emit(f"skipping socket/pipe/device {os.path.join(folder, n)}")
-            return special
+            rel = os.path.relpath(folder, stack)
+            special += [n for n in names if rel == "." and n == VOLUME_DIR]
+            out = [n for n in names if excludes and n not in special
+                   and excluded(n if rel == "." else f"{rel}/{n}", excludes)]
+            for n in out:
+                left_out.append(os.path.join(folder, n))
+                emit(f"leaving out {os.path.join(folder, n)} (backup_exclude)")
+            return special + out
 
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -2386,6 +2724,7 @@ def backup_work(stack: Path, dest: Path) -> StepWork:
             except ValueError:
                 shown = str(dest)
             extra = f" ({len(skipped)} socket/pipe file(s) skipped)" if skipped else ""
+            extra += f" ({len(left_out)} left out by backup_exclude)" if left_out else ""
             return True, f"{SYM['arrow']} {shown}{extra}", []
         except shutil.Error as e:
             failures = e.args[0] if e.args and isinstance(e.args[0], list) else []
@@ -2568,8 +2907,22 @@ ERROR_WORD_RE = re.compile(r"error|fatal|panic|exception|fail|denied|refused|not
 ERROR_MAX = 300
 
 
+SECRET_PATTERNS = (
+    (re.compile(r"(\w+://)[^/\s:@]+:[^/\s@]+@"), r"\1***:***@"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[\w.~+/=-]{8,}"), r"\1 ***"),
+    (re.compile(r"(?i)\b([\w-]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|auth))([\"']?\s*[=:]\s*)"
+                r"([\"']?)[^\s\"',;&]+"), r"\1\2\3***"),
+)
+
+
+def redact(text: str) -> str:
+    for pattern, replacement in SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def clean_error(text: str) -> str:
-    text = " ".join(ANSI_RE.sub("", str(text or "")).split())
+    text = redact(" ".join(ANSI_RE.sub("", str(text or "")).split()))
     return text if len(text) <= ERROR_MAX else text[:ERROR_MAX - 3].rstrip() + "..."
 
 
@@ -2793,6 +3146,8 @@ def registry_credentials(registry: str) -> tuple[str, str] | None:
 
 class _DropAuthOnNewHost(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urlsplit(newurl).scheme not in WEB_SCHEMES:
+            return None
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and urlsplit(newurl).netloc != urlsplit(req.full_url).netloc:
             new.headers.pop("Authorization", None)
@@ -2802,8 +3157,13 @@ class _DropAuthOnNewHost(HTTPRedirectHandler):
 _OPENER = build_opener(_DropAuthOnNewHost)
 
 
-def _http_open(url: str, timeout: float, method: str = "GET", headers: dict | None = None):
-    req = Request(url, method=method, headers={"User-Agent": f"{__title__}/{__version__}", **(headers or {})})
+WEB_SCHEMES = ("http", "https")
+
+
+def _http_open(url: str, timeout: float, method: str = "GET", headers: dict | None = None, data: bytes | None = None):
+    if urlsplit(url).scheme.lower() not in WEB_SCHEMES:
+        raise ValueError(f"only http(s) addresses are allowed: {url[:80]}")
+    req = Request(url, data=data, method=method, headers={"User-Agent": f"{__title__}/{__version__}", **(headers or {})})
     return _OPENER.open(req, timeout=timeout)
 
 
@@ -2856,7 +3216,7 @@ def _manifest_digest(url: str, ref: ImageRef, timeout: float) -> str:
                 if DIGEST_RE.fullmatch(digest):
                     return digest
                 if methods[0] == "GET":
-                    return "sha256:" + hashlib.sha256(r.read()).hexdigest()
+                    return "sha256:" + hashlib.sha256(r.read(REGISTRY_MAX_BYTES)).hexdigest()
         except HTTPError as e:
             if e.code == 401 and not authed:
                 authed = True
@@ -2869,10 +3229,20 @@ def _manifest_digest(url: str, ref: ImageRef, timeout: float) -> str:
     raise RegistryError("registry did not return a digest")
 
 
+@functools.lru_cache(maxsize=None)
+def insecure_registries() -> frozenset:
+    try:
+        data = json.loads(Path("/etc/docker/daemon.json").read_text(encoding="utf-8"))
+        found = data.get("insecure-registries") if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(str(r).strip().lower() for r in found if "/" not in str(r)) if isinstance(found, list) else frozenset()
+
+
 def remote_digest(ref: ImageRef, timeout: float | None = None) -> str:
     timeout = timeout or REGISTRY_TIMEOUT
     host = "registry-1.docker.io" if ref.registry == DOCKER_HUB else ref.registry
-    local = host.split(":")[0] in ("localhost", "127.0.0.1")
+    local = host.split(":")[0] in ("localhost", "127.0.0.1") or host in insecure_registries()
     problem = "no answer"
     for scheme in ("https", "http") if local else ("https",):
         try:
@@ -3191,7 +3561,7 @@ class IconStore:
 
     def download(self, url: str, stem: str, ext: str = "") -> dict:
         existing = [self.folder / f"{stem}.{ext}"] if ext else sorted(self.folder.glob(f"{stem}.*"))
-        existing = [f for f in existing if f.is_file()]
+        existing = [f for f in existing if f.is_file() and f.suffix not in (".new", ".tmp")]
         if existing:
             return {"icon": self.relative(existing[0]), "icon_url": url}
         with _http_open(url, REGISTRY_TIMEOUT) as r:
@@ -3200,7 +3570,7 @@ class IconStore:
         if kind not in ICON_TYPES or not data or len(data) > ICON_MAX_BYTES:
             raise ValueError("not a usable picture")
         file = self.folder / f"{stem}.{ext or ICON_TYPES[kind]}"
-        tmp = file.with_name(file.name + ".new")
+        tmp = file.with_name(f"{file.name}.{os.getpid()}.new")
         ensure_parent(tmp).write_bytes(data)
         os.replace(tmp, file)
         return {"icon": self.relative(file), "icon_url": url}
@@ -3234,11 +3604,16 @@ class IconStore:
         return dict(NO_ICON)
 
     def named(self, value: str) -> dict:
+        key = "url:" + value
         try:
             if value.startswith(("http://", "https://")):
+                if self.missed(key, seconds=ICON_URL_RETRY_SECONDS):
+                    return dict(NO_ICON)
                 return self.download(value, "url-" + hashlib.sha1(value.encode()).hexdigest()[:12])
             return self.find(icon_names(value)) if value else dict(NO_ICON)
         except ICON_ERRORS:
+            if value.startswith(("http://", "https://")):
+                self.missed(key, mark=True)
             return dict(NO_ICON)
 
     def first_download(self, urls: list[str], source: str) -> dict | None:
@@ -3249,14 +3624,14 @@ class IconStore:
                 continue
         return None
 
-    def missed(self, key: str, mark: bool = False) -> bool:
+    def missed(self, key: str, mark: bool = False, seconds: float = 0) -> bool:
         file = self.folder / "misses.json"
         try:
             misses = json.loads(file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             misses = {}
         if not mark:
-            return time.time() - float(misses.get(key) or 0) < ICON_MISS_SECONDS
+            return time.time() - float(misses.get(key) or 0) < (seconds or ICON_MISS_SECONDS)
         misses = {k: v for k, v in misses.items() if time.time() - float(v or 0) < ICON_MISS_SECONDS}
         misses[key] = time.time()
         try:
@@ -3444,9 +3819,13 @@ def run_soft_reset(cfg: Config, stacks: list[Path], dry_run: bool) -> int:
                     for key in ("icon", "icon_url", "icon_source"):
                         c.pop(key, None) if isinstance(c, dict) else None
         db.data.pop("release_check", None)
+        tmp = cfg.status_file.with_name(f".{cfg.status_file.name}.{os.getpid()}.tmp")
         try:
-            ensure_parent(cfg.status_file).write_text(json.dumps(db.data, indent=2) + "\n", encoding="utf-8")
+            ensure_parent(tmp).write_text(json.dumps(db.data, indent=2) + "\n", encoding="utf-8")
+            os.chmod(tmp, STATUS_FILE_MODE)
+            os.replace(tmp, cfg.status_file)
         except OSError as e:
+            tmp.unlink(missing_ok=True)
             say_error(f"Could not write {cfg.status_file}: {e.strerror or e}")
             return 2
     removed = sum(forget_auto_icons(stack) for stack in stacks)
@@ -3487,6 +3866,7 @@ def container_logo(stack: Path, names: list[str], only_one: bool, base: Path) ->
 SOURCE_REPO_RE = re.compile(r"^https://(github\.com|gitlab\.com)/([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
 REPO_LOGO_FOLDERS = (".github", "docs", "assets")
 ICON_MISS_SECONDS = 86400
+ICON_URL_RETRY_SECONDS = 3600
 
 
 def repo_raw_base(source_url: str) -> str:
@@ -3705,6 +4085,9 @@ def file_lock(path: Path, shared: bool = False):
         handle.close()
 
 
+STATUS_FILE_MODE = 0o644
+
+
 class StatusDB:
 
     HEALTH_KEYS = ("health", "summary", "problems", "checked_at", "containers")
@@ -3832,6 +4215,7 @@ class StatusDB:
         tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         try:
             ensure_parent(tmp).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            os.chmod(tmp, STATUS_FILE_MODE)
             os.replace(tmp, self.path)
         except OSError:
             tmp.unlink(missing_ok=True)
@@ -4173,7 +4557,14 @@ def create_cmd(services: list[str]) -> str:
     return f"{COMPOSE_CREATE} --force-recreate --no-deps " + " ".join(shlex.quote(name) for name in services)
 
 
-def start_containers(stack: Path, cfg: Config, ui: Runner) -> tuple[str, StepOutcome] | None:
+def start_containers(stack: Path, cfg: Config, ui: Runner, res: StackResult | None = None,
+                     backup: bool = False) -> tuple[str, StepOutcome] | None:
+    def before_create() -> StepOutcome | None:
+        if not backup or res is None or res.backup:
+            return None
+        out = take_backup(stack, cfg, ui, res)
+        return None if out.ok else out
+
     old = clear_old_containers(stack, ui)
     if old and not old.ok:
         return "Old containers", old
@@ -4182,6 +4573,9 @@ def start_containers(stack: Path, cfg: Config, ui: Runner) -> tuple[str, StepOut
         return "Start", unreadable(ui, "Start", err)
     declared = compose_order(stack)
     if not containers and declared is None:
+        failed = before_create()
+        if failed:
+            return "Backup", failed
         out = ui.step("Create", command_work(create_cmd([]), stack), timeout=cfg.command_timeout)
         return None if out.ok else ("Create", out)
     existing = {c["service"] for c in containers}
@@ -4196,6 +4590,9 @@ def start_containers(stack: Path, cfg: Config, ui: Runner) -> tuple[str, StepOut
             after = compose_ps(stack)[0] or []
             redo |= {c["service"] for c in after if c["service"] and c["state"] != "running"}
     if redo:
+        failed = before_create()
+        if failed:
+            return "Backup", failed
         names = [name for name in declared or sorted(redo) if name in redo]
         out = ui.step("Create", command_work(create_cmd(names), stack), timeout=cfg.command_timeout)
         if not out.ok:
@@ -4205,15 +4602,21 @@ def start_containers(stack: Path, cfg: Config, ui: Runner) -> tuple[str, StepOut
     return None
 
 
-def start_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
+CREATE_BACKUP_DRY = "would back up the stack folder (and its named volumes) first if containers have to be created"
+
+
+def start_stack(stack: Path, cfg: Config, ui: Runner, skip_backup: bool = False) -> StackResult:
     res = StackResult(stack.name)
+    backup = wants_backup(stack, cfg, skip_backup)
     if ui.dry_run:
+        if backup:
+            ui.dry("Backup", CREATE_BACKUP_DRY)
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
         ui.dry("Start", START_DRY)
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
         res.status = "would start"
         return res
-    failed = start_containers(stack, cfg, ui)
+    failed = start_containers(stack, cfg, ui, res, backup)
     if failed:
         return _fail(res, failed[0], failed[1], "start failed")
     out = ui.step("Health check", health_work(stack, cfg, res))
@@ -4251,10 +4654,13 @@ def remove_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     return res
 
 
-def restart_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
+def restart_stack(stack: Path, cfg: Config, ui: Runner, skip_backup: bool = False) -> StackResult:
     res = StackResult(stack.name)
+    backup = wants_backup(stack, cfg, skip_backup)
     if ui.dry_run:
         ui.dry("Stop", STOP_DRY)
+        if backup:
+            ui.dry("Backup", CREATE_BACKUP_DRY)
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
         ui.dry("Start", START_DRY)
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
@@ -4263,7 +4669,7 @@ def restart_stack(stack: Path, cfg: Config, ui: Runner) -> StackResult:
     out = stop_containers(stack, cfg, ui)
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
-    failed = start_containers(stack, cfg, ui)
+    failed = start_containers(stack, cfg, ui, res, backup)
     if failed:
         return _fail(res, failed[0], failed[1], "start failed - stack is stopped")
     out = ui.step("Health check", health_work(stack, cfg, res))
@@ -4302,19 +4708,38 @@ def ask_for_backup(stack: Path, backups: list[tuple[datetime, Path]]) -> Path | 
         say(yellow("  Invalid choice, try again."))
 
 
-def restore_work(stack: Path, backup: Path) -> StepWork:
+def clear_folder(folder: Path, root: Path, excludes: list[str]) -> None:
+    for entry in folder.iterdir():
+        if cancelled():
+            raise InterruptedError("cancelled")
+        rel = entry.relative_to(root).as_posix()
+        if excludes and excluded(rel, excludes):
+            continue
+        if entry.is_symlink() or not entry.is_dir():
+            entry.unlink()
+        elif excludes:
+            clear_folder(entry, root, excludes)
+            try:
+                entry.rmdir()
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(entry)
+
+
+def restore_work(stack: Path, backup: Path, excludes: list[str] | None = None) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
+        keep = excludes or []
+
+        def ignore(folder: str, names: list[str]) -> list[str]:
+            rel = os.path.relpath(folder, backup)
+            out = [n for n in names if rel == "." and n == VOLUME_DIR]
+            return out + ([n for n in names if excluded(n if rel == "." else f"{rel}/{n}", keep)] if keep else [])
         try:
-            emit(f"clearing {stack}")
-            for entry in stack.iterdir():
-                if cancelled():
-                    return False, "cancelled", []
-                if entry.is_symlink() or not entry.is_dir():
-                    entry.unlink()
-                else:
-                    shutil.rmtree(entry)
+            emit(f"clearing {stack}" + (" (keeping backup_exclude)" if keep else ""))
+            clear_folder(stack, stack, keep)
             emit(f"copying {backup} -> {stack}")
-            shutil.copytree(backup, stack, symlinks=True, copy_function=_copy_file, dirs_exist_ok=True)
+            shutil.copytree(backup, stack, symlinks=True, copy_function=_copy_file, dirs_exist_ok=True, ignore=ignore)
             _copy_dir_owners(backup, stack)
             return True, f"{SYM['arrow']} {backup.name}", []
         except shutil.Error as e:
@@ -4345,6 +4770,9 @@ def rollback_stack(stack: Path, cfg: Config, backup: Path, safety_backup: bool, 
         else:
             ui.skip("Safety backup", "skipped")
         ui.dry("Restore", f"would replace the stack folder with {backup}")
+        names = [v["name"] for v in backup_volumes_of(backup)]
+        if names and not cfg.no_volumes:
+            ui.dry("Restore volumes", f"would empty and refill: {', '.join(names)}")
         ui.dry("Old containers", OLD_CONTAINERS_DRY)
         ui.dry("Recreate", f"would run: {COMPOSE_CREATE} --force-recreate --remove-orphans")
         ui.dry("Health check", f"would wait up to {cfg.health_wait}s for healthy containers")
@@ -4355,20 +4783,25 @@ def rollback_stack(stack: Path, cfg: Config, backup: Path, safety_backup: bool, 
     if not out.ok:
         return _fail(res, "Stop", out, "stop failed, left as is")
 
+    replacing = [] if cfg.no_volumes else backup_volumes_of(backup)
     if safety_backup:
-        dest = new_backup_dest(stack, cfg)
-        out = ui.step("Safety backup", backup_work(stack, dest))
+        out = take_backup(stack, cfg, ui, res, "Safety backup", prune=False, replacing=replacing)
         if not out.ok:
             _fail(res, "Safety backup", out, "backup failed")
             return _restart_old(stack, cfg, ui, res, "rollback")
-        res.backup = str(dest)
     else:
         ui.skip("Safety backup", "skipped")
 
     kept = f" - the state before the rollback is in {res.backup}" if res.backup else ""
-    out = ui.step("Restore", restore_work(stack, backup))
+    out = ui.step("Restore", restore_work(stack, backup, backup_excludes(stack, cfg)))
     if not out.ok:
         return _fail(res, "Restore", out, f"restore failed, stack is stopped{kept}")
+    if cfg.no_volumes:
+        ui.skip("Restore volumes", "--no-volumes: the current volume data stays")
+    elif backup_volumes_of(backup):
+        out = ui.step("Restore volumes", volume_restore_work(backup, backup_excludes(stack, cfg)))
+        if not out.ok:
+            return _fail(res, "Restore volumes", out, f"volumes not (fully) restored, stack is stopped{kept}")
 
     old = clear_old_containers(stack, ui)
     if old and not old.ok:
@@ -4398,9 +4831,35 @@ def run_list_backups(stacks: list[Path], cfg: Config) -> int:
             say(dim("  no backups"))
         for when, folder in backups:
             age = fmt_age((datetime.now() - when).total_seconds())
-            say(f"  {folder.name}  {dim(when.strftime('%Y-%m-%d %H:%M') + ', ' + age)}")
+            volumes = len(backup_volumes_of(folder))
+            extra = f", {volumes} volume(s)" if volumes else ""
+            say(f"  {folder.name}  {dim(when.strftime('%Y-%m-%d %H:%M') + ', ' + age + extra)}")
     say()
     return 0
+
+
+def take_backup(stack: Path, cfg: Config, ui: Runner, res: StackResult, label: str = "Backup",
+                prune: bool = True, replacing: list[dict] | None = None) -> StepOutcome:
+    dest = new_backup_dest(stack, cfg)
+    excludes = backup_excludes(stack, cfg)
+    out = ui.step(label, backup_work(stack, dest, excludes))
+    if not out.ok:
+        return out
+    if wants_volumes(stack, cfg) or replacing:
+        out = ui.step("Volumes", volume_backup_work(stack, dest, excludes, replacing))
+        if not out.ok:
+            shutil.rmtree(dest, ignore_errors=True)
+            return out
+    res.backup = str(dest)
+    if not prune:
+        return out
+    if cfg.backup_retention > 0 or cfg.backup_large_mb > 0:
+        pruned = ui.step("Prune backups", prune_work(stack, cfg), warn_only=True)
+        if not pruned.ok:
+            res.warnings.append(Issue(res.name, "Prune backups", pruned.note, pruned.details, pruned.output))
+    else:
+        ui.skip("Prune backups", "retention 0, keeping all")
+    return out
 
 
 def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> StackResult:
@@ -4417,6 +4876,8 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         ui.dry("Stop", STOP_DRY)
         if do_backup:
             ui.dry("Backup", f"would copy to {cfg.backup_root(stack.name)}/<timestamp>")
+            if wants_volumes(stack, cfg):
+                ui.dry("Volumes", f"would archive the named volumes into <timestamp>/{VOLUME_DIR}")
             large = (f", or {max(1, cfg.backup_large_retention)} when a backup is over {cfg.backup_large_mb} MB"
                      if cfg.backup_large_mb > 0 else "")
             ui.dry("Prune backups", f"would keep newest {cfg.backup_retention or 'all'}{large}")
@@ -4436,19 +4897,10 @@ def update_stack(stack: Path, cfg: Config, do_backup: bool, ui: Runner) -> Stack
         return _fail(res, "Stop", out, "stop failed, left as is")
 
     if do_backup:
-        dest = new_backup_dest(stack, cfg)
-        out = ui.step("Backup", backup_work(stack, dest))
-        if out.ok:
-            res.backup = str(dest)
+        out = take_backup(stack, cfg, ui, res)
         if not out.ok:
             _fail(res, "Backup", out, "backup failed")
             return _restart_old(stack, cfg, ui, res, "backup")
-        if cfg.backup_retention > 0 or cfg.backup_large_mb > 0:
-            out = ui.step("Prune backups", prune_work(stack, cfg), warn_only=True)
-            if not out.ok:
-                res.warnings.append(Issue(res.name, "Prune backups", out.note, out.details, out.output))
-        else:
-            ui.skip("Prune backups", "retention 0, keeping all")
     else:
         ui.skip("Backup", "skipped")
 
@@ -4580,6 +5032,10 @@ class ErrorRule:
 class StackSettings:
     enabled: bool = True
     priority: int = STACK_PRIORITY
+    backup: str = "default"
+    backup_exclude: list = field(default_factory=list)
+    backup_volumes: str = "default"
+    update: bool = True
     icons: dict = field(default_factory=lambda: {"stack": "", "containers": {}})
     rules: list = field(default_factory=list)
     error: str = ""
@@ -4654,10 +5110,18 @@ def _read_settings(path: Path) -> StackSettings:
     block = data.get("stack") if isinstance(data.get("stack"), dict) else {
         "icons": data.get("icons"), "on_error": data.get("actions")}
     settings = StackSettings(complete=isinstance(data.get("stack"), dict)
-                             and all(k in block for k in ("enabled", "priority", "icons", "on_error")))
+                             and all(k in block for k in STACK_KEYS))
     try:
         settings.enabled = _parse_bool(str(block.get("enabled", "true")), "enabled")
         settings.priority = int(str(block.get("priority", STACK_PRIORITY)).strip() or STACK_PRIORITY)
+        choice = str(block.get("backup") or "default").strip().lower()
+        settings.backup = "default" if choice == "default" else str(_parse_bool(choice, "backup")).lower()
+        excludes = block.get("backup_exclude")
+        settings.backup_exclude = clean_patterns(
+            [str(x) for x in excludes if x] if isinstance(excludes, list) else split_list(str(excludes or "")))
+        settings.update = _parse_bool(str(block.get("update", "true")), "update")
+        choice = str(block.get("backup_volumes") or "default").strip().lower()
+        settings.backup_volumes = "default" if choice == "default" else str(_parse_bool(choice, "backup_volumes")).lower()
         icons = block.get("icons") if isinstance(block.get("icons"), dict) else {}
         containers = icons.get("containers") if isinstance(icons.get("containers"), dict) else {}
         settings.icons = {"stack": str(icons.get("stack") or ""),
@@ -4669,6 +5133,7 @@ def _read_settings(path: Path) -> StackSettings:
     return settings
 
 
+STACK_KEYS = ("enabled", "priority", "backup", "backup_volumes", "backup_exclude", "update", "icons", "on_error")
 _STACK_SETTINGS: dict[str, tuple[object, StackSettings]] = {}
 
 
@@ -4708,7 +5173,12 @@ def render_rule(rule_: ErrorRule) -> list[str]:
     lines.append("      actions:")
     for name, value, options in rule_.steps:
         lines.append(f"        - {name}:" + (f" {yaml_value(value)}" if value else ""))
-        lines += [f"          {k}: {yaml_value(v)}" for k, v in options.items() if v is not None]
+        for k, v in options.items():
+            if isinstance(v, dict):
+                lines.append(f"          {k}:")
+                lines += [f"            {hk}: {yaml_value(hv)}" for hk, hv in v.items() if hv is not None]
+            elif v is not None:
+                lines.append(f"          {k}: {yaml_value(v)}")
     return lines
 
 
@@ -4718,6 +5188,15 @@ def render_stack_file(settings: StackSettings) -> str:
              f"  enabled: {'true' if settings.enabled else 'false'}",
              "  # Lower numbers start first and stop last; stacks with the same number run side by side",
              f"  priority: {settings.priority}",
+             "  # Back up before an update: true, false, or default (= backup in TugBoat.conf)",
+             f"  backup: {settings.backup}",
+             "  # Archive the named volumes too: true, false, or default (= backup_volumes in TugBoat.conf)",
+             f"  backup_volumes: {settings.backup_volumes}",
+             "  # Left out of backups and kept on a rollback, one '- \"pattern\"' per line (\"cache\", \"*.log\", \"volume:NAME\")",
+             "  backup_exclude:",
+             *(f"    - {json.dumps(p)}" for p in settings.backup_exclude),
+             "  # false: --update --all and --auto skip this stack (naming it still updates it)",
+             f"  update: {'true' if settings.update else 'false'}",
              "  # An http(s) address, a file in this folder or an icon name; empty = TugBoat finds one",
              "  icons:", f"    stack: {yaml_value(settings.icons.get('stack', ''))}", "    containers:"]
     lines += [f"      {name}: {yaml_value(value)}" for name, value in sorted(settings.icons.get("containers", {}).items())]
@@ -4741,7 +5220,7 @@ def update_stack_file(stack: Path, icons: dict | None = None, replace_icons: boo
             "containers": {**icons.get("containers", {}), **{k: v for k, v in settings.icons["containers"].items() if v}}}
         if merged == settings.icons and settings.complete:
             return False
-        settings = StackSettings(settings.enabled, settings.priority, merged, settings.rules)
+        settings = replace(settings, icons=merged)
     elif settings.complete:
         return False
     tmp = path.with_name(f".{path.name}.{os.getpid()}.new")
@@ -4780,13 +5259,15 @@ def delay_work(seconds: float) -> StepWork:
     return work
 
 
-def webhook_work(url: str, payload: dict) -> StepWork:
+WEBHOOK_METHODS = ("POST", "PUT", "GET")
+
+
+def webhook_work(url: str, payload: dict, method: str = "POST", headers: dict | None = None) -> StepWork:
     def work(emit: Callable[[str], None]) -> tuple[bool, str, list[str]]:
-        request = Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
-                          headers={"Content-Type": "application/json",
-                                   "User-Agent": f"{__title__}/{__version__}"})
+        body = None if method == "GET" else json.dumps(payload).encode("utf-8")
         try:
-            with urlopen(request, timeout=10) as response:
+            with _http_open(url, 10, method, {**({"Content-Type": "application/json"} if body else {}),
+                                              **(headers or {})}, body) as response:
                 return True, f"HTTP {response.status}", []
         except HTTPError as e:
             return False, f"HTTP {e.code}", []
@@ -4818,11 +5299,17 @@ def step_webhook(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
         return False, "webhook needs an http(s) address"
     values = webhook_values(run)
     url = re.sub(r"\{(\w+)\}", lambda m: quote(values[m.group(1)], safe="") if m.group(1) in values else m.group(0), value)
+    method = str(options.get("method") or "POST").strip().upper()
+    if method not in WEBHOOK_METHODS:
+        return False, f"webhook method must be {', '.join(WEBHOOK_METHODS)}"
+    raw_headers = options.get("headers") if isinstance(options.get("headers"), dict) else {}
+    headers = {str(k): re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), str(v))
+               for k, v in raw_headers.items() if v is not None}
     payload = {**values, "problems": run.snap["problems"],
                "containers": [{k: c.get(k, "") for k in ("name", "state", "health", "error")}
                               for c in run.snap.get("containers") or [] if c.get("error") or c.get("state") != "running"],
                "steps_done": run.done, "time": now_iso(), "tugboat_version": __version__}
-    out = run.ui.step("Webhook", webhook_work(url, payload))
+    out = run.ui.step("Webhook", webhook_work(url, payload, method, headers))
     return out.ok, out.note
 
 
@@ -4834,8 +5321,9 @@ def step_delay(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
 def step_stack(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
     action, _, target = value.partition(" ")
     actions = {"stop": stop_stack, "start": start_stack, "restart": restart_stack, "remove": remove_stack,
-               "update": lambda stack, cfg, ui: update_stack(stack, cfg, cfg.backup, ui)}
-    targets = run.stacks if target.strip().lower() == "all" else [
+               "update": lambda stack, cfg, ui: update_stack(stack, cfg, wants_backup(stack, cfg), ui)}
+    every = target.strip().lower() == "all"
+    targets = [s for s in run.stacks if not (action == "update" and not stack_settings(s).update)] if every else [
         s for s in run.stacks if s.name.lower() == target.strip().lower()]
     targets = [s for wave in by_priority(targets, reverse=action in ("stop", "remove")) for s in wave]
     if action not in actions or not targets:
@@ -4855,8 +5343,20 @@ def step_script(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
     env = {"TUGBOAT_STACK": run.stack.name, "TUGBOAT_STACK_DIR": str(run.stack),
            "TUGBOAT_HEALTH": run.snap["health"], "TUGBOAT_SUMMARY": run.snap["summary"],
            "TUGBOAT_PROBLEMS": "\n".join(run.snap["problems"]), "TUGBOAT_STATUS_FILE": str(run.cfg.status_file)}
-    out = run.ui.step("Script", command_work(value, run.stack, env=env), timeout=run.cfg.command_timeout)
+    out = run.ui.step("Script", command_work(value, run.stack, env=env,
+                                             run_as_user=owner_run_as(run.stack / STACK_FILE)),
+                      timeout=run.cfg.command_timeout)
     return out.ok, out.note
+
+
+REBOOT_MIN_UPTIME = 600
+
+
+def host_uptime() -> float | None:
+    try:
+        return float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def step_reboot(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
@@ -4864,6 +5364,9 @@ def step_reboot(run: ErrorRun, value: str, options: dict) -> tuple[bool, str]:
         return True, "off"
     if os.geteuid() != 0:
         return False, "rebooting needs root"
+    up = host_uptime()
+    if up is not None and up < REBOOT_MIN_UPTIME:
+        return False, f"the host started {fmt_time(up)} ago - not rebooting again this soon"
     for stack in [s for wave in by_priority(run.stacks, reverse=True) for s in wave]:
         with stack_job(stack, 30, None):
             run.ui.out(f"  {cyan(SYM['arrow'])} stop {stack.name}")
@@ -4926,11 +5429,11 @@ def due_error_actions(selected: list[Path], db: StatusDB, quiet: bool = False) -
         if rule_ is None or stopped_on_purpose:
             continue
         last = entry.get("error_action") or {}
-        if last.get("finished_at") and not last.get("recovered") and not last.get("skipped") \
-                and is_fresh(last.get("started_at"), rule_.cooldown):
+        if not last.get("recovered") and not last.get("skipped") and is_fresh(last.get("started_at"), rule_.cooldown):
             if quiet:
                 continue
-            say(dim(f"  {stack.name}: error actions ran {fmt_ago(last.get('started_at'))} without fixing it - "
+            what = "ran" if last.get("finished_at") else "started"
+            say(dim(f"  {stack.name}: error actions {what} {fmt_ago(last.get('started_at'))} without fixing it - "
                     f"next try after {fmt_time(rule_.cooldown)}"))
             continue
         due.append((stack, rule_))
@@ -5084,8 +5587,10 @@ def main() -> int:
                         help="update only stacks that have a new image version (update only)")
     parser.add_argument("-j", "--parallel", type=int, metavar="N",
                         help="stacks to handle at the same time (default: parallel_stacks in the config)")
+    parser.add_argument("--no-volumes", action="store_true",
+                        help="leave named volumes out: not archived in backups, not restored by a rollback")
     parser.add_argument("--skip-backup", action="store_true",
-                        help="skip the backup step (update and rollback)")
+                        help="skip the backup (update, rollback, and start/restart when containers have to be created)")
     parser.add_argument("--to", metavar="BACKUP",
                         help="the backup to roll back to, by folder name or its start (rollback only)")
     images_opt = parser.add_mutually_exclusive_group()
@@ -5255,6 +5760,11 @@ def main() -> int:
             return 2
     elif args.all or args.auto or action == "healthcheck" or len(stacks) == 1:
         selected = stacks
+        held = [s for s in selected if action == "update" and not stack_settings(s).update]
+        if held:
+            say(dim(f"  Not updated (update: false in {STACK_FILE}; name a stack to update it anyway): "
+                    f"{', '.join(s.name for s in held)}"))
+            selected = [s for s in selected if s not in held]
     else:
         selected = ask_for_stacks(stacks, action, snaps, db)
     if not selected:
@@ -5320,6 +5830,8 @@ def main() -> int:
             code = run_error_actions(selected, db, cfg, stacks, args.verbose) or (2 if code == 2 else 0)
         return code
 
+    if args.no_volumes:
+        cfg = replace(cfg, no_volumes=True)
     do_backup = cfg.backup and not args.skip_backup
     ui = Runner(verbose=args.verbose, dry_run=args.dry_run)
 
@@ -5373,11 +5885,11 @@ def main() -> int:
 
     jobs: dict[str, Callable[[Path, Runner], StackResult]] = {
         "stop": lambda stack, runner: stop_stack(stack, cfg, runner),
-        "start": lambda stack, runner: start_stack(stack, cfg, runner),
+        "start": lambda stack, runner: start_stack(stack, cfg, runner, args.skip_backup),
         "remove": lambda stack, runner: remove_stack(stack, cfg, runner),
-        "restart": lambda stack, runner: restart_stack(stack, cfg, runner),
+        "restart": lambda stack, runner: restart_stack(stack, cfg, runner, args.skip_backup),
         "rollback": lambda stack, runner: rollback_stack(stack, cfg, rollback_to, not args.skip_backup, runner),
-        "update": lambda stack, runner: update_stack(stack, cfg, do_backup, runner),
+        "update": lambda stack, runner: update_stack(stack, cfg, wants_backup(stack, cfg, args.skip_backup), runner),
     }
 
     def run_one(stack: Path, runner: Runner, act: str) -> StackResult:
